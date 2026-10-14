@@ -1,0 +1,68 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.text.cstring
+
+/** How far a checkout has got: the path it just wrote (none for the first call), and the steps done
+ * out of the total. */
+struct CheckoutProgress derives Eq, Display
+    path: Option[string]
+    completed: usize
+    total: usize
+
+/** The closure a checkout reports to, boxed so `progress_payload` can point at it. */
+private[libgit2] struct CheckoutWatch
+    cb: &Fn(CheckoutProgress) -> unit
+
+/** The function libgit2 calls for checkout progress, finding the closure through the payload. */
+private[libgit2] checkout_progressed(path: *u8, completed: usize, total: usize, payload: *u8)
+    val w: *CheckoutWatch = ptr_cast(payload)
+
+    w.cb(CheckoutProgress(maybe_text(path), completed, total))
+
+/** Fill `opts` — already initialised by `git_checkout_options_init` — with a strategy and a progress
+ * callback. `watch` must outlive the call the options are passed to. */
+private[libgit2] fill_checkout(opts: *c.CheckoutOptions, force: bool, watch: Option[&CheckoutWatch])
+    opts.checkout_strategy = if force then c.CHECKOUT_FORCE else c.CHECKOUT_SAFE
+
+    watch match
+        Some(w) ->
+            opts.progress_cb = &checkout_progressed
+            opts.progress_payload = ptr_cast(&*w)
+        None -> ()
+
+private watch_of(cb: Option[&Fn(CheckoutProgress) -> unit]) -> Option[&CheckoutWatch] = cb match
+    Some(f) -> Some(CheckoutWatch(f))
+    None -> None
+
+private[libgit2] checkout_tree[T: GitObject](repo: &Repository, target: &T, force: bool,
+                                             on_progress: Option[&Fn(CheckoutProgress) -> unit]) -> Result[unit, Error]
+    var store: [c.CHECKOUT_OPTIONS_WORDS]u64 = [0; c.CHECKOUT_OPTIONS_WORDS]
+    val opts: *c.CheckoutOptions = ptr_cast(&store[0])
+    val watch = watch_of(on_progress)
+
+    check(c.checkout_options_init(opts, c.CHECKOUT_OPTIONS_VERSION))?
+    fill_checkout(opts, force, watch)
+    check(c.checkout_tree(repo.raw, target.object_ptr(), opts))
+
+private[libgit2] checkout_head(repo: &Repository, force: bool,
+                               on_progress: Option[&Fn(CheckoutProgress) -> unit]) -> Result[unit, Error]
+    var store: [c.CHECKOUT_OPTIONS_WORDS]u64 = [0; c.CHECKOUT_OPTIONS_WORDS]
+    val opts: *c.CheckoutOptions = ptr_cast(&store[0])
+    val watch = watch_of(on_progress)
+
+    check(c.checkout_options_init(opts, c.CHECKOUT_OPTIONS_VERSION))?
+    fill_checkout(opts, force, watch)
+    check(c.checkout_head(repo.raw, opts))
+
+/** `git checkout <branch>`: write the branch's tree into the working tree and index, then point
+ * `HEAD` at the branch. A safe checkout refuses to overwrite a change, answering `Conflict`, and
+ * leaves `HEAD` where it was. */
+private[libgit2] checkout_branch(repo: &Repository, name: string, force: bool,
+                                 on_progress: Option[&Fn(CheckoutProgress) -> unit]) -> Result[unit, Error]
+    val branch = find_branch(repo, name, Local)?
+    val target = revparse(repo, branch.name())?
+    val commit = target.as_commit()?
+
+    checkout_tree(repo, commit, force, on_progress)?
+    check(c.repository_set_head(repo.raw, cstring(branch.name()).ptr))

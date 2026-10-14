@@ -1,0 +1,185 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+
+/** Which branches a listing wants: `git_branch_t`. */
+enum BranchKind derives Display
+    Local
+    Remote
+    AllBranches
+
+private branch_code(k: BranchKind) -> i32 = k match
+    Local -> c.BRANCH_LOCAL
+    Remote -> c.BRANCH_REMOTE
+    AllBranches -> c.BRANCH_ALL
+
+/** A reference: a name (`refs/heads/main`, `HEAD`, `refs/tags/v1`) that points at an object, or at
+ * another reference. */
+struct Reference
+    private[libgit2] raw: *c.Reference
+    private[libgit2] repo: &Repository
+
+    /** The full name, `refs/heads/main`. */
+    name(self) -> string = text(c.reference_name(self.raw))
+
+    /** The name as git abbreviates it, `main`. */
+    shorthand(self) -> string = text(c.reference_shorthand(self.raw))
+
+    /** Whether it names another reference rather than an object. */
+    is_symbolic(self) -> bool = c.reference_type(self.raw) == c.REFERENCE_SYMBOLIC
+
+    /** The object a direct reference points at; `None` for a symbolic one. */
+    target(self) -> Option[Oid]
+        val p = c.reference_target(self.raw)
+
+        if p == null then None else Some(oid_at(p))
+
+    /** The reference a symbolic one names; `None` for a direct one. */
+    symbolic_target(self) -> Option[string] = maybe_text(c.reference_symbolic_target(self.raw))
+
+    /** Follow symbolic references to the direct one at the end. */
+    resolve(self) -> Result[&Reference, Error]
+        var out: *c.Reference = null
+
+        check(c.reference_resolve(&out, self.raw))?
+        Ok(Reference(out, self.repo))
+
+    /** For a branch, whether `HEAD` points at it. */
+    is_head(self) -> bool = c.branch_is_head(self.raw) == 1
+
+    /** For a branch, its name without `refs/heads/`. */
+    branch_name(self) -> Result[string, Error]
+        var out: *u8 = null
+
+        check(c.branch_name(&out, self.raw))?
+        Ok(text(out))
+
+    /** Delete the reference from the repository. This value goes on describing what it was. */
+    delete(self) -> Result[unit, Error] = check(c.reference_delete(self.raw))
+
+    /** Delete the branch, which must not be the one checked out. */
+    delete_branch(self) -> Result[unit, Error] = check(c.branch_delete(self.raw))
+end Reference
+
+impl Drop for Reference
+    drop(self) = c.reference_free(self.raw)
+
+// ## The repository's side
+
+private[libgit2] find_reference(repo: &Repository, name: string) -> Result[&Reference, Error]
+    var out: *c.Reference = null
+
+    check(c.reference_lookup(&out, repo.raw, cstring(name).ptr))?
+    Ok(Reference(out, repo))
+
+private[libgit2] reference_id(repo: &Repository, name: string) -> Result[Oid, Error]
+    var out = c.Oid([0; 20])
+
+    check(c.reference_name_to_id(&out, repo.raw, cstring(name).ptr))?
+    Ok(Oid(out))
+
+private[libgit2] create_reference(repo: &Repository, name: string, id: Oid, force: bool,
+                                  log_message: string) -> Result[&Reference, Error]
+    var out: *c.Reference = null
+    var raw = id.raw
+
+    check(c.reference_create(&out, repo.raw, cstring(name).ptr, &raw, if force then 1 else 0,
+                             cstring(log_message).ptr))?
+    Ok(Reference(out, repo))
+
+private[libgit2] create_symbolic(repo: &Repository, name: string, target: string, force: bool,
+                                 log_message: string) -> Result[&Reference, Error]
+    var out: *c.Reference = null
+
+    check(c.reference_symbolic_create(&out, repo.raw, cstring(name).ptr, cstring(target).ptr,
+                                      if force then 1 else 0, cstring(log_message).ptr))?
+    Ok(Reference(out, repo))
+
+private[libgit2] reference_names(repo: &Repository) -> Result[Buf[string], Error]
+    var out = c.StrArray(null, 0)
+
+    check(c.reference_list(&out, repo.raw))?
+    Ok(strings_of(&out))
+
+private[libgit2] create_branch(repo: &Repository, name: string, target: &Commit,
+                               force: bool) -> Result[&Reference, Error]
+    var out: *c.Reference = null
+
+    check(c.branch_create(&out, repo.raw, cstring(name).ptr, target.raw, if force then 1 else 0))?
+    Ok(Reference(out, repo))
+
+private[libgit2] find_branch(repo: &Repository, name: string,
+                             kind: BranchKind) -> Result[&Reference, Error]
+    var out: *c.Reference = null
+
+    check(c.branch_lookup(&out, repo.raw, cstring(name).ptr, branch_code(kind)))?
+    Ok(Reference(out, repo))
+
+/** An iterator libgit2 allocated, freed when the box goes. */
+private struct RawBranchIterator
+    raw: *c.BranchIterator
+
+impl Drop for RawBranchIterator
+    drop(self) = c.branch_iterator_free(self.raw)
+
+private[libgit2] branches(repo: &Repository, kind: BranchKind) -> Result[Buf[&Reference], Error]
+    var it: *c.BranchIterator = null
+
+    check(c.branch_iterator_new(&it, repo.raw, branch_code(kind)))?
+
+    val owner: &RawBranchIterator = RawBranchIterator(it)
+    val out: Buf[&Reference] = buf()
+
+    loop
+        var r: *c.Reference = null
+        var t: i32 = 0
+        val rc = c.branch_next(&r, &t, owner.raw)
+
+        if rc == c.ITEROVER then return Ok(out)
+
+        check(rc)?
+        out.push(Reference(r, repo))
+end branches
+
+private[libgit2] tag_names(repo: &Repository) -> Result[Buf[string], Error]
+    var out = c.StrArray(null, 0)
+
+    check(c.tag_list(&out, repo.raw))?
+    Ok(strings_of(&out))
+
+private[libgit2] create_tag[T: GitObject](repo: &Repository, name: string, target: &T,
+                                          tagger: Signature, message: string,
+                                          force: bool) -> Result[Oid, Error]
+    val sig = raw_signature(tagger)?
+    var out = c.Oid([0; 20])
+
+    check(c.tag_create(&out, repo.raw, cstring(name).ptr, target.object_ptr(), sig.raw,
+                       cstring(message).ptr, if force then 1 else 0))?
+    Ok(Oid(out))
+
+private[libgit2] create_lightweight_tag[T: GitObject](repo: &Repository, name: string, target: &T,
+                                                      force: bool) -> Result[Oid, Error]
+    var out = c.Oid([0; 20])
+
+    check(c.tag_create_lightweight(&out, repo.raw, cstring(name).ptr, target.object_ptr(),
+                                   if force then 1 else 0))?
+    Ok(Oid(out))
+
+private[libgit2] delete_tag(repo: &Repository, name: string) -> Result[unit, Error] =
+    check(c.tag_delete(repo.raw, cstring(name).ptr))
+
+/** What `tag_foreach` hands its callback: a tag reference's full name and the object it points at. */
+private struct TagVisit
+    cb: &Fn(string, Oid) -> bool
+
+private tag_visited(name: *u8, id: *c.Oid, payload: *u8) -> i32
+    val v: *TagVisit = ptr_cast(payload)
+
+    if v.cb(text(name), oid_at(id)) then 0 else 1
+
+private[libgit2] tag_foreach(repo: &Repository, cb: &Fn(string, Oid) -> bool) -> Result[unit, Error]
+    val v: &TagVisit = TagVisit(cb)
+
+    check(c.tag_foreach(repo.raw, &tag_visited, ptr_cast(&*v)))

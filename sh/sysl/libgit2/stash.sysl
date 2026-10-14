@@ -1,0 +1,52 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+
+/** One entry of the stash: its position (0 is the newest, `stash@{0}`), its message, and the id of
+ * the stash commit. */
+struct StashEntry derives Eq, Display
+    index: usize
+    message: string
+    id: Oid
+
+private[libgit2] stash_save(repo: &Repository, stasher: Signature, message: string,
+                            untracked: bool) -> Result[Oid, Error]
+    val sig = raw_signature(stasher)?
+    var out = c.Oid([0; 20])
+
+    check(c.stash_save(&out, repo.raw, sig.raw, cstring(message).ptr,
+                       if untracked then c.STASH_INCLUDE_UNTRACKED else c.STASH_DEFAULT))?
+    Ok(Oid(out))
+
+private[libgit2] stash_apply(repo: &Repository, index: usize, pop: bool) -> Result[unit, Error]
+    var store: [c.STASH_APPLY_OPTIONS_WORDS]u64 = [0; c.STASH_APPLY_OPTIONS_WORDS]
+    val opts: *c.StashApplyOptions = ptr_cast(&store[0])
+
+    check(c.stash_apply_options_init(opts, c.STASH_APPLY_OPTIONS_VERSION))?
+    check(if pop then c.stash_pop(repo.raw, index, opts) else c.stash_apply(repo.raw, index, opts))
+
+private[libgit2] stash_drop(repo: &Repository, index: usize) -> Result[unit, Error] =
+    check(c.stash_drop(repo.raw, index))
+
+private struct StashWalk
+    cb: &Fn(StashEntry) -> bool
+
+private stash_seen(index: usize, message: *u8, id: *c.Oid, payload: *u8) -> i32
+    val w: *StashWalk = ptr_cast(payload)
+
+    if w.cb(StashEntry(index, text(message), oid_at(id))) then 0 else 1
+
+private[libgit2] stash_foreach(repo: &Repository, cb: &Fn(StashEntry) -> bool) -> Result[unit, Error]
+    val w: &StashWalk = StashWalk(cb)
+
+    check(c.stash_foreach(repo.raw, &stash_seen, ptr_cast(&*w)))
+
+private[libgit2] stashes(repo: &Repository) -> Result[Buf[StashEntry], Error]
+    val out: Buf[StashEntry] = buf()
+
+    stash_foreach(repo, (e) ->
+        out.push(e)
+        true)?
+    Ok(out)

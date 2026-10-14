@@ -1,0 +1,98 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+
+/** A file's status: `git_status_t`, a set of flags for the index side (HEAD to index) and the
+ * working-tree side (index to working tree). */
+struct Status derives Eq, Display
+    bits: u32
+
+    private has(self, flag: u32) -> bool = self.bits & flag != 0
+
+    /** Nothing to report: the file is the same in `HEAD`, the index and the working tree. */
+    is_current(self) -> bool = self.bits == 0
+
+    index_new(self) -> bool = self.has(c.STATUS_INDEX_NEW)
+    index_modified(self) -> bool = self.has(c.STATUS_INDEX_MODIFIED)
+    index_deleted(self) -> bool = self.has(c.STATUS_INDEX_DELETED)
+    index_renamed(self) -> bool = self.has(c.STATUS_INDEX_RENAMED)
+    index_typechange(self) -> bool = self.has(c.STATUS_INDEX_TYPECHANGE)
+    wt_new(self) -> bool = self.has(c.STATUS_WT_NEW)
+    wt_modified(self) -> bool = self.has(c.STATUS_WT_MODIFIED)
+    wt_deleted(self) -> bool = self.has(c.STATUS_WT_DELETED)
+    wt_typechange(self) -> bool = self.has(c.STATUS_WT_TYPECHANGE)
+    wt_renamed(self) -> bool = self.has(c.STATUS_WT_RENAMED)
+    ignored(self) -> bool = self.has(c.STATUS_IGNORED)
+    conflicted(self) -> bool = self.has(c.STATUS_CONFLICTED)
+
+    /** The two-letter code `git status --porcelain` prints: the index side, then the working tree's.
+     * An untracked file is `??`, an ignored one `!!`, a conflicted one `UU`. */
+    porcelain(self) -> string
+        if self.conflicted() then return "UU"
+        if self.ignored() then return "!!"
+        if self.wt_new() && !self.index_new() then return "??"
+
+        self.index_letter() + self.worktree_letter()
+
+    private index_letter(self) -> string
+        if self.index_new() then return "A"
+        if self.index_modified() then return "M"
+        if self.index_deleted() then return "D"
+        if self.index_renamed() then return "R"
+        if self.index_typechange() then "T" else " "
+
+    private worktree_letter(self) -> string
+        if self.wt_modified() then return "M"
+        if self.wt_deleted() then return "D"
+        if self.wt_renamed() then return "R"
+        if self.wt_typechange() then "T" else " "
+end Status
+
+/** A path and its status. */
+struct StatusEntry derives Eq, Display
+    path: string
+    status: Status
+
+private struct StatusWalk
+    cb: &Fn(string, Status) -> bool
+
+private status_seen(path: *u8, flags: u32, payload: *u8) -> i32
+    val w: *StatusWalk = ptr_cast(payload)
+
+    if w.cb(text(path), Status(flags)) then 0 else 1
+
+/** Report every path with something to say to `cb`, sorted byte-wise as git sorts, until it answers
+ * `false`. Untracked files are listed one by one, as `git status --porcelain -uall` lists them;
+ * ignored ones only where `ignored` is set. */
+private[libgit2] status_foreach(repo: &Repository, untracked: bool, ignored: bool,
+                                cb: &Fn(string, Status) -> bool) -> Result[unit, Error]
+    var store: [c.STATUS_OPTIONS_WORDS]u64 = [0; c.STATUS_OPTIONS_WORDS]
+    val opts: *c.StatusOptions = ptr_cast(&store[0])
+    val w: &StatusWalk = StatusWalk(cb)
+
+    check(c.status_options_init(opts, c.STATUS_OPTIONS_VERSION))?
+    opts.show = c.STATUS_SHOW_INDEX_AND_WORKDIR
+    opts.flags = c.STATUS_OPT_SORT_CASE_SENSITIVELY
+
+    if untracked then
+        opts.flags = opts.flags | c.STATUS_OPT_INCLUDE_UNTRACKED | c.STATUS_OPT_RECURSE_UNTRACKED_DIRS
+    if ignored then opts.flags = opts.flags | c.STATUS_OPT_INCLUDE_IGNORED
+
+    check(c.status_foreach_ext(repo.raw, opts, &status_seen, ptr_cast(&*w)))
+
+private[libgit2] statuses(repo: &Repository, untracked: bool,
+                          ignored: bool) -> Result[Buf[StatusEntry], Error]
+    val out: Buf[StatusEntry] = buf()
+
+    status_foreach(repo, untracked, ignored, (p, s) ->
+        out.push(StatusEntry(p, s))
+        true)?
+    Ok(out)
+
+private[libgit2] status_file(repo: &Repository, path: string) -> Result[Status, Error]
+    var flags: u32 = 0
+
+    check(c.status_file(&flags, repo.raw, cstring(path).ptr))?
+    Ok(Status(flags))

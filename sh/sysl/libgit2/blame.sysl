@@ -1,0 +1,60 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+
+/** A run of consecutive lines that came from one commit, copied out of libgit2's blame. Line numbers
+ * count from 1, as `git blame` prints them. */
+struct BlameHunk derives Eq, Display
+    /** How many lines the run covers. */
+    lines: usize
+    /** The commit that last changed these lines. */
+    commit: Oid
+    /** Where the run starts in the file as it is now. */
+    start: usize
+    /** Where the run started in that commit's version of the file. */
+    orig_start: usize
+    /** The file's path in that commit. */
+    orig_path: string
+    /** The author of that commit, where libgit2 could read one. */
+    author: Option[Signature]
+    /** Whether the commit is the boundary of the blame — the oldest one looked at. */
+    boundary: bool
+
+private hunk_from(h: *c.BlameHunk) -> BlameHunk =
+    BlameHunk(h.lines_in_hunk, Oid(h.final_commit_id), h.final_start_line_number,
+              h.orig_start_line_number, text(h.orig_path),
+              if h.final_signature == null then None else Some(signature_of(h.final_signature)),
+              h.boundary != 0)
+
+/** A blame libgit2 allocated, freed when the box goes. */
+private struct RawBlame
+    raw: *c.Blame
+
+impl Drop for RawBlame
+    drop(self) = c.blame_free(self.raw)
+
+/** Blame `path` (relative to the working tree's root) as of `newest`, or `HEAD`. */
+private[libgit2] blame(repo: &Repository, path: string,
+                       newest: Option[Oid]) -> Result[Buf[BlameHunk], Error]
+    var store: [c.BLAME_OPTIONS_WORDS]u64 = [0; c.BLAME_OPTIONS_WORDS]
+    val opts: *c.BlameOptions = ptr_cast(&store[0])
+
+    check(c.blame_options_init(opts, c.BLAME_OPTIONS_VERSION))?
+
+    newest match
+        Some(id) -> opts.newest_commit = id.raw
+        None -> ()
+
+    var out: *c.Blame = null
+
+    check(c.blame_file(&out, repo.raw, cstring(path).ptr, opts))?
+
+    val owner: &RawBlame = RawBlame(out)
+    val hunks: Buf[BlameHunk] = buf()
+
+    for i in 0..<c.blame_get_hunk_count(owner.raw) do
+        hunks.push(hunk_from(c.blame_get_hunk_byindex(owner.raw, i)))
+    Ok(hunks)
+end blame

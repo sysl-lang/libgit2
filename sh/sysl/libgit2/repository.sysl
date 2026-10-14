@@ -1,0 +1,306 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, from_utf8, from_utf8_lossy}
+
+/** What a repository is in the middle of: `git_repository_state_t`. */
+enum State derives Eq, Display
+    /** Nothing: no merge, rebase, revert, cherry-pick, bisect or `am` is in progress. */
+    Clean
+    Merge
+    Revert
+    RevertSequence
+    CherryPick
+    CherryPickSequence
+    Bisect
+    Rebase
+    RebaseInteractive
+    RebaseMerge
+    ApplyMailbox
+    ApplyMailboxOrRebase
+    /** A state newer than this binding. */
+    UnknownState(code: int)
+end State
+
+private state_of(s: i32) -> State
+    if s == c.REPOSITORY_STATE_NONE then return Clean
+    if s == c.REPOSITORY_STATE_MERGE then return Merge
+    if s == c.REPOSITORY_STATE_REVERT then return Revert
+    if s == c.REPOSITORY_STATE_REVERT_SEQUENCE then return RevertSequence
+    if s == c.REPOSITORY_STATE_CHERRYPICK then return CherryPick
+    if s == c.REPOSITORY_STATE_CHERRYPICK_SEQUENCE then return CherryPickSequence
+    if s == c.REPOSITORY_STATE_BISECT then return Bisect
+    if s == c.REPOSITORY_STATE_REBASE then return Rebase
+    if s == c.REPOSITORY_STATE_REBASE_INTERACTIVE then return RebaseInteractive
+    if s == c.REPOSITORY_STATE_REBASE_MERGE then return RebaseMerge
+    if s == c.REPOSITORY_STATE_APPLY_MAILBOX then return ApplyMailbox
+    if s == c.REPOSITORY_STATE_APPLY_MAILBOX_OR_REBASE then ApplyMailboxOrRebase else UnknownState(s)
+end state_of
+
+/** A git repository, open.
+ *
+ * **Everything read out of it keeps it open.** A commit, a tree, a reference, an index, a diff: each
+ * holds a share of this box, because libgit2 requires a repository to outlive every object it handed
+ * out — so the repository is freed when the last of them goes, never before.
+ */
+struct Repository
+    private[libgit2] raw: *c.Repository
+
+    /** The `.git` directory, with a trailing `/`. */
+    path(self) -> string = text(c.repository_path(self.raw))
+
+    /** The working tree, with a trailing `/`, or `None` for a bare repository. */
+    workdir(self) -> Option[string] = maybe_text(c.repository_workdir(self.raw))
+
+    is_bare(self) -> bool = c.repository_is_bare(self.raw) == 1
+
+    /** Whether the repository has no commits and `HEAD` points at the default unborn branch. */
+    is_empty(self) -> Result[bool, Error] = flag(c.repository_is_empty(self.raw))
+
+    /** Whether `HEAD` names a branch that has no commits yet. */
+    head_unborn(self) -> Result[bool, Error] = flag(c.repository_head_unborn(self.raw))
+
+    /** Whether `HEAD` names a commit directly rather than a branch. */
+    head_detached(self) -> Result[bool, Error] = flag(c.repository_head_detached(self.raw))
+
+    /** What the repository is in the middle of. */
+    state(self) -> State = state_of(c.repository_state(self.raw))
+
+    /** Forget a merge, revert, cherry-pick or rebase in progress (`MERGE_HEAD` and friends). */
+    cleanup_state(self) -> Result[unit, Error] = check(c.repository_state_cleanup(self.raw))
+
+    /** The reference `HEAD` resolves to. An unborn branch is `UnbornBranch`. */
+    head(&self) -> Result[&Reference, Error]
+        var out: *c.Reference = null
+
+        check(c.repository_head(&out, self.raw))?
+        Ok(Reference(out, self))
+
+    /** Point `HEAD` at `refname` (`refs/heads/main`), which need not exist yet. */
+    set_head(self, refname: string) -> Result[unit, Error] =
+        check(c.repository_set_head(self.raw, cstring(refname).ptr))
+
+    /** Point `HEAD` straight at a commit. */
+    set_head_detached(self, id: Oid) -> Result[unit, Error]
+        var raw = id.raw
+
+        check(c.repository_set_head_detached(self.raw, &raw))
+
+    /** The index, the staging area the next commit is made from. */
+    index(&self) -> Result[&Index, Error]
+        var out: *c.Index = null
+
+        check(c.repository_index(&out, self.raw))?
+        Ok(Index(out, self))
+
+    /** The repository's configuration, every level layered (system, global, local). */
+    config(&self) -> Result[&Config, Error]
+        var out: *c.Config = null
+
+        check(c.repository_config(&out, self.raw))?
+        Ok(Config(out))
+
+    // ## Objects
+
+    /** The object `id` names, of whatever kind. */
+    find_object(&self, id: Oid, kind: Kind = AnyKind) -> Result[&Object, Error] =
+        lookup_object(self, id, kind)
+
+    find_commit(&self, id: Oid) -> Result[&Commit, Error] = lookup_commit(self, id)
+    find_tree(&self, id: Oid) -> Result[&Tree, Error] = lookup_tree(self, id)
+    find_blob(&self, id: Oid) -> Result[&Blob, Error] = lookup_blob(self, id)
+    find_tag(&self, id: Oid) -> Result[&Tag, Error] = lookup_tag(self, id)
+
+    /** The object a revision names, as `git rev-parse` reads it: `HEAD~2`, `main:src/a.c`, `v1^{}`. */
+    revparse(&self, spec: string) -> Result[&Object, Error] = revparse(self, spec)
+
+    /** Write `data` as a blob and answer its id. */
+    write_blob(&self, data: []const u8) -> Result[Oid, Error] = write_blob(self, data)
+
+    /** A tree builder, empty or starting from `base`'s entries. */
+    tree_builder(&self, base: Option[&Tree] = None) -> Result[&TreeBuilder, Error] =
+        tree_builder(self, base)
+
+    /** Write a commit of `tree` with `parents`, and move `update_ref` (`"HEAD"`, `refs/heads/x`) to it
+     * when given — which must then currently point at the first parent. */
+    commit(&self, update_ref: Option[string], author: Signature, committer: Signature,
+           message: string, tree: &Tree, parents: []const &Commit) -> Result[Oid, Error] =
+        create_commit(self, update_ref, author, committer, message, tree, parents)
+
+    // ## References, branches and tags
+
+    find_reference(&self, name: string) -> Result[&Reference, Error] = find_reference(self, name)
+
+    /** The id `name` resolves to, through any symbolic references. */
+    reference_id(&self, name: string) -> Result[Oid, Error] = reference_id(self, name)
+
+    /** Make the direct reference `name` point at `id`; an existing one is `Exists` unless `force`. */
+    create_reference(&self, name: string, id: Oid, force: bool = false,
+                     log_message: string = "") -> Result[&Reference, Error] =
+        create_reference(self, name, id, force, log_message)
+
+    /** Make `name` a symbolic reference to `target`. */
+    create_symbolic_reference(&self, name: string, target: string, force: bool = false,
+                              log_message: string = "") -> Result[&Reference, Error] =
+        create_symbolic(self, name, target, force, log_message)
+
+    /** Every reference's full name, sorted as libgit2 lists them. */
+    references(&self) -> Result[Buf[string], Error] = reference_names(self)
+
+    /** Make the branch `name` at `target`; an existing one is `Exists` unless `force`. */
+    create_branch(&self, name: string, target: &Commit, force: bool = false) -> Result[&Reference, Error] =
+        create_branch(self, name, target, force)
+
+    find_branch(&self, name: string, kind: BranchKind = Local) -> Result[&Reference, Error] =
+        find_branch(self, name, kind)
+
+    /** Every branch of `kind`. */
+    branches(&self, kind: BranchKind = Local) -> Result[Buf[&Reference], Error] = branches(self, kind)
+
+    /** Every tag's name, without `refs/tags/`. */
+    tag_names(&self) -> Result[Buf[string], Error] = tag_names(self)
+
+    /** Make the annotated tag `name` on `target`. */
+    create_tag[T: GitObject](&self, name: string, target: &T, tagger: Signature, message: string,
+                             force: bool = false) -> Result[Oid, Error] =
+        create_tag(self, name, target, tagger, message, force)
+
+    /** Make the lightweight tag `name`: a reference straight to `target`. */
+    create_lightweight_tag[T: GitObject](&self, name: string, target: &T,
+                                         force: bool = false) -> Result[Oid, Error] =
+        create_lightweight_tag(self, name, target, force)
+
+    delete_tag(&self, name: string) -> Result[unit, Error] = delete_tag(self, name)
+
+    /** Report every tag reference's full name and target to `cb`, until it answers `false`. */
+    tag_foreach(&self, cb: &Fn(string, Oid) -> bool) -> Result[unit, Error] = tag_foreach(self, cb)
+
+    // ## Checkout
+
+    /** Write `target`'s tree into the working tree and index. `HEAD` does not move. */
+    checkout_tree[T: GitObject](&self, target: &T, force: bool = false,
+                                on_progress: Option[&Fn(CheckoutProgress) -> unit] = None) -> Result[unit, Error] =
+        checkout_tree(self, target, force, on_progress)
+
+    /** Make the working tree and index match `HEAD`. */
+    checkout_head(&self, force: bool = false,
+                  on_progress: Option[&Fn(CheckoutProgress) -> unit] = None) -> Result[unit, Error] =
+        checkout_head(self, force, on_progress)
+
+    /** `git checkout <name>`: the branch's tree, then `HEAD` to the branch. */
+    checkout_branch(&self, name: string, force: bool = false,
+                    on_progress: Option[&Fn(CheckoutProgress) -> unit] = None) -> Result[unit, Error] =
+        checkout_branch(self, name, force, on_progress)
+
+    // ## History, diffs, status and blame
+
+    /** A walk over history, with nothing pushed yet. */
+    revwalk(&self) -> Result[&Revwalk, Error] = revwalk(self)
+
+    /** The diff from `old` to `new`; `None` on either side is the empty tree. */
+    diff_trees(&self, old: Option[&Tree], new: Option[&Tree],
+               context_lines: int = 3) -> Result[&Diff, Error] =
+        diff_tree_to_tree(self, old, new, context_lines)
+
+    /** The diff from `old` to the index (`git diff --cached`). */
+    diff_tree_to_index(&self, old: Option[&Tree], context_lines: int = 3) -> Result[&Diff, Error] =
+        diff_tree_to_index(self, old, context_lines)
+
+    /** The diff from the index to the working tree (`git diff`), with untracked files as additions
+     * where `untracked`. */
+    diff_index_to_workdir(&self, untracked: bool = false,
+                          context_lines: int = 3) -> Result[&Diff, Error] =
+        diff_index_to_workdir(self, untracked, context_lines)
+
+    /** Report every path with a status to `cb`, sorted as git sorts, until it answers `false`. */
+    status_foreach(&self, cb: &Fn(string, Status) -> bool) -> Result[unit, Error] =
+        status_foreach(self, true, false, cb)
+
+    /** Every path with a status: untracked files one by one, ignored ones where `ignored`. */
+    statuses(&self, untracked: bool = true, ignored: bool = false) -> Result[Buf[StatusEntry], Error] =
+        statuses(self, untracked, ignored)
+
+    /** The status of one path. */
+    status_file(&self, path: string) -> Result[Status, Error] = status_file(self, path)
+
+    /** `git blame path`, as of `newest` or `HEAD`. */
+    blame(&self, path: string, newest: Option[Oid] = None) -> Result[Buf[BlameHunk], Error] =
+        blame(self, path, newest)
+
+    // ## The stash
+
+    /** `git stash push -m message`; with nothing to stash, `NotFound`. */
+    stash_save(&self, stasher: Signature, message: string,
+               untracked: bool = false) -> Result[Oid, Error] =
+        stash_save(self, stasher, message, untracked)
+
+    stash_apply(&self, index: usize = 0) -> Result[unit, Error] = stash_apply(self, index, false)
+    stash_pop(&self, index: usize = 0) -> Result[unit, Error] = stash_apply(self, index, true)
+    stash_drop(&self, index: usize = 0) -> Result[unit, Error] = stash_drop(self, index)
+
+    /** Report every stash entry, newest first, to `cb` until it answers `false`. */
+    stash_foreach(&self, cb: &Fn(StashEntry) -> bool) -> Result[unit, Error] = stash_foreach(self, cb)
+
+    stashes(&self) -> Result[Buf[StashEntry], Error] = stashes(self)
+end Repository
+
+impl Drop for Repository
+    drop(self) = c.repository_free(self.raw)
+
+private flag(rc: i32) -> Result[bool, Error] = if rc < 0 then Err(last_error(rc)) else Ok(rc == 1)
+
+/** Open the repository at `dir` — the working tree or the `.git` directory itself. It does not search
+ * the parent directories; [discover] does. A directory that is not a repository is `NotFound`. */
+open(dir: string) -> Result[&Repository, Error]
+    ensure_init()
+
+    var out: *c.Repository = null
+
+    check(c.repository_open_ext(&out, cstring(dir).ptr, c.REPOSITORY_OPEN_NO_SEARCH, null))?
+    Ok(Repository(out))
+
+/** The `.git` directory of the repository `start` is inside, searching upward as `git` does. */
+discover(start: string) -> Result[string, Error]
+    ensure_init()
+
+    var out = c.Buf(null, 0, 0)
+
+    check(c.repository_discover(&out, cstring(start).ptr, 0, null))?
+    taken(&out)
+
+/** Make a new repository at `dir` (`git init`, or `git init --bare`). */
+init(dir: string, bare: bool = false) -> Result[&Repository, Error]
+    ensure_init()
+
+    var out: *c.Repository = null
+
+    check(c.repository_init(&out, cstring(dir).ptr, if bare then 1 else 0))?
+    Ok(Repository(out))
+
+/** A `git_buf` libgit2 filled, copied into a `string` and disposed of. */
+private[libgit2] taken(b: *c.Buf) -> Result[string, Error]
+    val s = if b.ptr == null then "" else from_bytes(b.ptr, b.size)
+
+    c.buf_dispose(b)
+    Ok(s)
+
+/** `n` bytes at `p`, copied into a `string`. libgit2's text is UTF-8 where git's is; where it is not
+ * — a Latin-1 file's content in a patch — each invalid sequence becomes U+FFFD, since a `string` is
+ * UTF-8 by construction. [Blob.content] is the way to the bytes as they are. */
+private[libgit2] from_bytes(p: *u8, n: usize) -> string
+    if n == 0 then return ""
+
+    val bytes = p[0..<n]
+
+    from_utf8(bytes) match
+        Ok(s) -> s.copy()
+        Err(_) -> from_utf8_lossy(bytes)
+
+/** A `git_strarray` libgit2 filled, copied and disposed of. */
+private[libgit2] strings_of(a: *c.StrArray) -> Buf[string]
+    val out: Buf[string] = buf()
+
+    for i in 0..<a.count do out.push(text(a.strings[i]))
+    c.strarray_dispose(a)
+    out

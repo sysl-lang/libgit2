@@ -1,0 +1,50 @@
+module sh.sysl.libgit2
+@tests
+
+// The README's example, compiled and run, so the page cannot drift from the package.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.write_text
+
+// -- README example begins
+/** Commit `files` onto `HEAD` of the repository at `dir`, then answer `git log --oneline`. */
+commit_and_log(dir: string, files: []const (string, string), message: string) -> Result[string, Error]
+    val repo = open(dir)?
+    val index = repo.index()?
+
+    for (name, text) in files
+        write_text(s"$dir/$name", text).expect(s"wrote $name")
+        index.add(name)?
+
+    index.write()?
+
+    val tree = repo.find_tree(index.write_tree()?)?
+    val me = signature_now("Ann Author", "ann@example.com")?
+    val parents: Buf[&Commit] = buf()
+
+    if !repo.head_unborn()? then parents.push(repo.revparse("HEAD")?.as_commit()?)
+
+    repo.commit(Some("HEAD"), me, me, message, tree, parents.view())?
+
+    val walk = repo.revwalk()?
+
+    walk.push_head()?
+
+    var log = ""
+
+    for id in walk.ids()?
+        log += s"${id.short()} ${repo.find_commit(id)?.summary()}\n"
+    Ok(log)
+// -- README example ends
+
+@test("the README's example commits twice and logs both, newest first, as git log --oneline does")
+readme_example()
+    val dir = scratch("example")
+
+    init(dir).expect("a repository")
+    commit_and_log(dir, [("a.txt", "a\n")], "Add a").expect("committed")
+
+    val log = commit_and_log(dir, [("b.txt", "b\n")], "Add b").expect("committed")
+
+    assert_eq(log, git(dir, ["log", "--oneline", "--abbrev=7"]))
+    assert_eq(git1(dir, ["log", "-1", "--format=%an <%ae>"]), "Ann Author <ann@example.com>")

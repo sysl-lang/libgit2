@@ -1,0 +1,203 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+
+/** What happened to a file between the two sides of a diff: `git_delta_t`. */
+enum DeltaStatus derives Eq, Display
+    Unmodified
+    Added
+    Deleted
+    Modified
+    Renamed
+    Copied
+    Ignored
+    Untracked
+    TypeChange
+    Unreadable
+    Conflicted
+    UnknownDelta(code: int)
+end DeltaStatus
+
+private delta_status_of(s: i32) -> DeltaStatus
+    if s == c.DELTA_UNMODIFIED then return Unmodified
+    if s == c.DELTA_ADDED then return Added
+    if s == c.DELTA_DELETED then return Deleted
+    if s == c.DELTA_MODIFIED then return Modified
+    if s == c.DELTA_RENAMED then return Renamed
+    if s == c.DELTA_COPIED then return Copied
+    if s == c.DELTA_IGNORED then return Ignored
+    if s == c.DELTA_UNTRACKED then return Untracked
+    if s == c.DELTA_TYPECHANGE then return TypeChange
+    if s == c.DELTA_UNREADABLE then return Unreadable
+    if s == c.DELTA_CONFLICTED then Conflicted else UnknownDelta(s)
+
+/** One side of a delta. */
+struct DiffFile derives Eq, Display
+    path: string
+    /** The blob's id; all zeros for a side that does not exist or was not hashed. */
+    id: Oid
+    size: long
+    mode: Mode
+
+/** One file's change, copied out of the diff. */
+struct Delta derives Eq, Display
+    status: DeltaStatus
+    old_file: DiffFile
+    new_file: DiffFile
+
+/** A hunk's header: the line ranges on each side and the `@@ … @@` line itself. */
+struct Hunk derives Eq, Display
+    old_start: int
+    old_lines: int
+    new_start: int
+    new_lines: int
+    /** The `@@ -a,b +c,d @@ context` line, newline included. */
+    header: string
+
+/** One line of a patch. `origin` is `' '` for context, `'+'` and `'-'` for an added and a removed
+ * line, and `'='`, `'>'`, `'<'` for the end-of-file markers. */
+struct Line derives Eq, Display
+    origin: u8
+    /** The line's number on the old side, or -1 for an added line. */
+    old_lineno: int
+    /** The line's number on the new side, or -1 for a removed line. */
+    new_lineno: int
+    /** The text, newline included where the file has one. */
+    content: string
+
+/** What [Diff.foreach] reports, in patch order: each file, each hunk of it, each line of a hunk. */
+enum DiffEvent derives Eq, Display
+    FileChanged(delta: Delta)
+    HunkStarted(hunk: Hunk)
+    LineOf(line: Line)
+
+private diff_file_of(f: c.DiffFile) -> DiffFile =
+    DiffFile(text(f.path), Oid(f.id), long(f.size), mode_of(i32(f.mode)))
+
+private[libgit2] delta_of(d: *c.DiffDelta) -> Delta =
+    Delta(delta_status_of(d.status), diff_file_of(d.old_file), diff_file_of(d.new_file))
+
+private hunk_of(h: *c.DiffHunk) -> Hunk =
+    Hunk(h.old_start, h.old_lines, h.new_start, h.new_lines,
+         from_bytes(&h.header[0], h.header_len))
+
+/** A diff: a list of deltas, each of which can be rendered as a patch. */
+struct Diff
+    private raw: *c.Diff
+    private repo: &Repository
+
+    /** How many files changed. */
+    len(self) -> usize = c.diff_num_deltas(self.raw)
+
+    /** The delta at `i`. */
+    delta(self, i: usize) -> Option[Delta]
+        val d = c.diff_get_delta(self.raw, i)
+
+        if d == null then None else Some(delta_of(d))
+
+    /** Every delta. */
+    deltas(self) -> Buf[Delta]
+        val out: Buf[Delta] = buf()
+
+        for i in 0..<c.diff_num_deltas(self.raw) do out.push(delta_of(c.diff_get_delta(self.raw, i)))
+        out
+
+    /** The whole diff as a patch, the text `git diff` prints. */
+    patch(self) -> Result[string, Error]
+        var out = c.Buf(null, 0, 0)
+
+        check(c.diff_to_buf(&out, self.raw, c.DIFF_FORMAT_PATCH))?
+        taken(&out)
+
+    /** The patch for the delta at `i` alone. */
+    patch_of(self, i: usize) -> Result[string, Error]
+        var p: *c.Patch = null
+
+        check(c.patch_from_diff(&p, self.raw, i))?
+
+        var out = c.Buf(null, 0, 0)
+        val rc = c.patch_to_buf(&out, p)
+
+        c.patch_free(p)
+        check(rc)?
+        taken(&out)
+
+    /** Report every file, hunk and line to `cb`, in patch order, until it answers `false`. A stop is
+     * not an error: the call answers `Ok`. */
+    foreach(self, cb: &Fn(DiffEvent) -> bool) -> Result[unit, Error]
+        val w: &DiffWalk = DiffWalk(cb)
+
+        check(c.diff_foreach(self.raw, &file_seen, null, &hunk_seen, &line_seen, ptr_cast(&*w)))
+end Diff
+
+impl Drop for Diff
+    drop(self) = c.diff_free(self.raw)
+
+private struct DiffWalk
+    cb: &Fn(DiffEvent) -> bool
+
+// A non-zero answer stops `git_diff_foreach`, which then answers that number; `GIT_EUSER` would be
+// reported as a failure, so a stop answers 1.
+private answer(go_on: bool) -> i32 = if go_on then 0 else 1
+
+private file_seen(d: *c.DiffDelta, progress: f32, payload: *u8) -> i32
+    val w: *DiffWalk = ptr_cast(payload)
+
+    answer(w.cb(FileChanged(delta_of(d))))
+
+private hunk_seen(d: *c.DiffDelta, h: *c.DiffHunk, payload: *u8) -> i32
+    val w: *DiffWalk = ptr_cast(payload)
+
+    answer(w.cb(HunkStarted(hunk_of(h))))
+
+private line_seen(d: *c.DiffDelta, h: *c.DiffHunk, l: *c.DiffLine, payload: *u8) -> i32
+    val w: *DiffWalk = ptr_cast(payload)
+
+    answer(w.cb(LineOf(Line(l.origin, l.old_lineno, l.new_lineno, from_bytes(l.content, l.content_len)))))
+
+/** Diff options filled by `git_diff_options_init`, in storage that lives as long as this value. */
+private struct DiffSettings
+    store: [c.DIFF_OPTIONS_WORDS]u64
+
+private diff_settings(context_lines: int, untracked: bool) -> Result[&DiffSettings, Error]
+    val s: &DiffSettings = DiffSettings([0; c.DIFF_OPTIONS_WORDS])
+    val opts: *c.DiffOptions = ptr_cast(&s.store[0])
+
+    check(c.diff_options_init(opts, c.DIFF_OPTIONS_VERSION))?
+    opts.context_lines = u32(context_lines)
+
+    if untracked then
+        opts.flags = opts.flags | c.DIFF_INCLUDE_UNTRACKED | c.DIFF_SHOW_UNTRACKED_CONTENT |
+                     c.DIFF_RECURSE_UNTRACKED_DIRS
+    Ok(s)
+
+private opts_of(s: &DiffSettings) -> *c.DiffOptions = ptr_cast(&s.store[0])
+
+private tree_ptr(t: Option[&Tree]) -> *c.Tree = t match
+    Some(x) -> x.raw
+    None -> null
+
+private[libgit2] diff_tree_to_tree(repo: &Repository, old: Option[&Tree], new: Option[&Tree],
+                                   context_lines: int) -> Result[&Diff, Error]
+    val s = diff_settings(context_lines, false)?
+    var out: *c.Diff = null
+
+    check(c.diff_tree_to_tree(&out, repo.raw, tree_ptr(old), tree_ptr(new), opts_of(s)))?
+    Ok(Diff(out, repo))
+
+private[libgit2] diff_tree_to_index(repo: &Repository, old: Option[&Tree],
+                                    context_lines: int) -> Result[&Diff, Error]
+    val s = diff_settings(context_lines, false)?
+    var out: *c.Diff = null
+
+    check(c.diff_tree_to_index(&out, repo.raw, tree_ptr(old), null, opts_of(s)))?
+    Ok(Diff(out, repo))
+
+private[libgit2] diff_index_to_workdir(repo: &Repository, untracked: bool,
+                                       context_lines: int) -> Result[&Diff, Error]
+    val s = diff_settings(context_lines, untracked)?
+    var out: *c.Diff = null
+
+    check(c.diff_index_to_workdir(&out, repo.raw, null, opts_of(s)))?
+    Ok(Diff(out, repo))

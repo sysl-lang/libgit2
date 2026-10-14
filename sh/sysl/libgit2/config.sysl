@@ -1,0 +1,84 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.text.cstring
+
+/** Git configuration: a repository's layered one, or a single file.
+ *
+ * A key is `section.name` or `section.subsection.name`. A key that is not set is `NotFound`. A write
+ * goes to the highest-priority level the object has — for a repository's, that is `.git/config`.
+ */
+struct Config
+    private[libgit2] raw: *c.Config
+
+    get_string(self, key: string) -> Result[string, Error]
+        var out = c.Buf(null, 0, 0)
+
+        check(c.config_get_string_buf(&out, self.raw, cstring(key).ptr))?
+        taken(&out)
+
+    set_string(self, key: string, value: string) -> Result[unit, Error] =
+        check(c.config_set_string(self.raw, cstring(key).ptr, cstring(value).ptr))
+
+    /** An integer, with git's `k`, `m` and `g` suffixes understood. */
+    get_int(self, key: string) -> Result[long, Error]
+        var out: i64 = 0
+
+        check(c.config_get_int64(&out, self.raw, cstring(key).ptr))?
+        Ok(out)
+
+    set_int(self, key: string, value: long) -> Result[unit, Error] =
+        check(c.config_set_int64(self.raw, cstring(key).ptr, value))
+
+    /** A boolean, read as git reads one (`true`, `yes`, `on`, `1`, and their opposites). */
+    get_bool(self, key: string) -> Result[bool, Error]
+        var out: i32 = 0
+
+        check(c.config_get_bool(&out, self.raw, cstring(key).ptr))?
+        Ok(out != 0)
+
+    set_bool(self, key: string, value: bool) -> Result[unit, Error] =
+        check(c.config_set_bool(self.raw, cstring(key).ptr, if value then 1 else 0))
+
+    /** Remove `key` from the level writes go to. */
+    remove(self, key: string) -> Result[unit, Error] =
+        check(c.config_delete_entry(self.raw, cstring(key).ptr))
+end Config
+
+impl Drop for Config
+    drop(self) = c.config_free(self.raw)
+
+/** A level of configuration outside the repository. */
+enum ConfigLevel
+    /** `%PROGRAMDATA%\Git\config`, on Windows. */
+    ProgramData
+    /** `$(prefix)/etc/gitconfig`. */
+    System
+    /** `~/.config/git/config`. */
+    Xdg
+    /** `~/.gitconfig`. */
+    Global
+
+/** Look for `level`'s configuration file in `dir` rather than where libgit2 would by default — every
+ * repository opened after this reads it from there. A directory with no `.gitconfig` in it shuts the
+ * level out: what a test, or a tool that must not depend on the user's settings, wants.
+ * (`GIT_OPT_SET_SEARCH_PATH`.) */
+set_search_path(level: ConfigLevel, dir: string) -> Result[unit, Error]
+    ensure_init()
+
+    val code = level match
+        ProgramData -> c.CONFIG_LEVEL_PROGRAMDATA
+        System -> c.CONFIG_LEVEL_SYSTEM
+        Xdg -> c.CONFIG_LEVEL_XDG
+        Global -> c.CONFIG_LEVEL_GLOBAL
+
+    check(c.libgit2_opts(c.OPT_SET_SEARCH_PATH, code, cstring(dir).ptr))
+
+/** The configuration file at `file`, alone — created on the first write if it does not exist. */
+open_config(file: string) -> Result[&Config, Error]
+    ensure_init()
+
+    var out: *c.Config = null
+
+    check(c.config_open_ondisk(&out, cstring(file).ptr))?
+    Ok(Config(out))

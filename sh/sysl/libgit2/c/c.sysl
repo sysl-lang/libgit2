@@ -1,0 +1,672 @@
+// libgit2's C API (`git2.h`), declared verbatim.
+//
+// **The declarations over the library the machine has.** Nothing here is meant to be called by a
+// program: every name and convention is C's, so an object is a pointer the caller frees with the
+// matching `git_*_free`, a failure is a negative integer with the reason in `git_error_last()`, and a
+// callback is one word of code with a `void *` beside it. The module above this one turns those into
+// sysl and is what an application imports.
+//
+// **Every option struct is declared field by field** and `tests.sysl` asserts each one's size against
+// the header's, so a libgit2 that grows a field fails a test rather than corrupting a call. The one
+// exception is `git_clone_options`, which nests the fetch options, the remote callbacks and the proxy
+// options — some forty fields of which a binding sets four. It is carried as storage the header sizes,
+// and those four are written at the offsets the C compiler reports.
+
+module sh.sysl.libgit2.c
+@link("git2")
+
+@include("stddef.h")
+@include("git2.h")
+
+opaque struct Repository
+opaque struct Index
+opaque struct IndexEntry
+opaque struct Object
+opaque struct Commit
+opaque struct Tree
+opaque struct TreeEntry
+opaque struct TreeBuilder
+opaque struct Blob
+opaque struct Tag
+opaque struct Reference
+opaque struct BranchIterator
+opaque struct Revwalk
+opaque struct Diff
+opaque struct Patch
+opaque struct Blame
+opaque struct Config
+opaque struct Credential
+
+// `git_oid`: twenty bytes of SHA-1. libgit2 is built without `GIT_EXPERIMENTAL_SHA256`, which would
+// put a type byte in front; `tests.sysl` asserts the size, so a build with it fails there.
+struct Oid
+    id: [20]u8
+
+// `git_time`.
+struct Time
+    time: i64
+    offset: i32
+    sign: u8
+
+// `git_signature`.
+struct Signature
+    name: *u8
+    email: *u8
+    when: Time
+
+// `git_error`.
+struct Error
+    message: *u8
+    klass: i32
+
+// `git_buf`, which the caller disposes of with `git_buf_dispose`.
+struct Buf
+    ptr: *u8
+    reserved: usize
+    size: usize
+
+// `git_strarray`.
+struct StrArray
+    strings: **u8
+    count: usize
+
+type CheckoutNotifyCb = *extern(i32, *u8, *DiffFile, *DiffFile, *DiffFile, *u8) -> i32
+type CheckoutProgressCb = *extern(*u8, usize, usize, *u8) -> unit
+type CheckoutPerfdataCb = *extern(*u8, *u8) -> unit
+type StatusCb = *extern(*u8, u32, *u8) -> i32
+type DiffFileCb = *extern(*DiffDelta, f32, *u8) -> i32
+type DiffBinaryCb = *extern(*DiffDelta, *u8, *u8) -> i32
+type DiffHunkCb = *extern(*DiffDelta, *DiffHunk, *u8) -> i32
+type DiffLineCb = *extern(*DiffDelta, *DiffHunk, *DiffLine, *u8) -> i32
+type DiffNotifyCb = *extern(*Diff, *DiffDelta, *u8, *u8) -> i32
+type DiffProgressCb = *extern(*Diff, *u8, *u8, *u8) -> i32
+type StashCb = *extern(usize, *u8, *Oid, *u8) -> i32
+type StashApplyProgressCb = *extern(i32, *u8) -> i32
+type TagForeachCb = *extern(*u8, *Oid, *u8) -> i32
+type CredentialAcquireCb = *extern(**Credential, *u8, *u8, u32, *u8) -> i32
+type IndexerProgressCb = *extern(*IndexerProgress, *u8) -> i32
+
+// `git_checkout_options`.
+struct CheckoutOptions
+    version: u32
+    checkout_strategy: u32
+    disable_filters: i32
+    dir_mode: u32
+    file_mode: u32
+    file_open_flags: i32
+    notify_flags: u32
+    notify_cb: CheckoutNotifyCb
+    notify_payload: *u8
+    progress_cb: CheckoutProgressCb
+    progress_payload: *u8
+    paths: StrArray
+    baseline: *Tree
+    baseline_index: *Index
+    target_directory: *u8
+    ancestor_label: *u8
+    our_label: *u8
+    their_label: *u8
+    perfdata_cb: CheckoutPerfdataCb
+    perfdata_payload: *u8
+end CheckoutOptions
+
+// `git_status_options`.
+struct StatusOptions
+    version: u32
+    show: i32
+    flags: u32
+    pathspec: StrArray
+    baseline: *Tree
+    rename_threshold: u16
+
+// `git_diff_options`.
+struct DiffOptions
+    version: u32
+    flags: u32
+    ignore_submodules: i32
+    pathspec: StrArray
+    notify_cb: DiffNotifyCb
+    progress_cb: DiffProgressCb
+    payload: *u8
+    context_lines: u32
+    interhunk_lines: u32
+    oid_type: i32
+    id_abbrev: u16
+    max_size: i64
+    old_prefix: *u8
+    new_prefix: *u8
+end DiffOptions
+
+// `git_diff_file`.
+struct DiffFile
+    id: Oid
+    path: *u8
+    size: u64
+    flags: u32
+    mode: u16
+    id_abbrev: u16
+
+// `git_diff_delta`.
+struct DiffDelta
+    status: i32
+    flags: u32
+    similarity: u16
+    nfiles: u16
+    old_file: DiffFile
+    new_file: DiffFile
+
+// `git_diff_hunk`; the header is not NUL-terminated, `header_len` is its length.
+struct DiffHunk
+    old_start: i32
+    old_lines: i32
+    new_start: i32
+    new_lines: i32
+    header_len: usize
+    header: [128]u8
+
+// `git_diff_line`; `content` is not NUL-terminated, `content_len` is its length.
+struct DiffLine
+    origin: u8
+    old_lineno: i32
+    new_lineno: i32
+    num_lines: i32
+    content_len: usize
+    content_offset: i64
+    content: *u8
+
+// `git_blame_options`.
+struct BlameOptions
+    version: u32
+    flags: u32
+    min_match_characters: u16
+    newest_commit: Oid
+    oldest_commit: Oid
+    min_line: usize
+    max_line: usize
+
+// `git_blame_hunk`.
+struct BlameHunk
+    lines_in_hunk: usize
+    final_commit_id: Oid
+    final_start_line_number: usize
+    final_signature: *Signature
+    final_committer: *Signature
+    orig_commit_id: Oid
+    orig_path: *u8
+    orig_start_line_number: usize
+    orig_signature: *Signature
+    orig_committer: *Signature
+    summary: *u8
+    boundary: u8
+end BlameHunk
+
+// `git_stash_apply_options`.
+struct StashApplyOptions
+    version: u32
+    flags: u32
+    checkout_options: CheckoutOptions
+    progress_cb: StashApplyProgressCb
+    progress_payload: *u8
+
+// `git_indexer_progress`.
+struct IndexerProgress
+    total_objects: u32
+    indexed_objects: u32
+    received_objects: u32
+    local_objects: u32
+    total_deltas: u32
+    indexed_deltas: u32
+    received_bytes: usize
+
+// ## Library and errors
+
+extern "git_libgit2_init" libgit2_init() -> i32
+extern "git_libgit2_version" libgit2_version(major: *i32, minor: *i32, rev: *i32) -> i32
+extern "git_error_last" error_last() -> *Error
+
+// `git_libgit2_opts` is C-variadic: what follows the option is that option's arguments.
+extern "git_libgit2_opts" libgit2_opts(option: i32, ...) -> i32
+
+// ## Repository
+
+extern "git_repository_open" repository_open(out: **Repository, dir: *u8) -> i32
+extern "git_repository_open_ext" repository_open_ext(out: **Repository, dir: *u8, flags: u32,
+                                                    ceiling: *u8) -> i32
+extern "git_repository_init" repository_init(out: **Repository, dir: *u8, is_bare: u32) -> i32
+extern "git_repository_discover" repository_discover(out: *Buf, start: *u8, across_fs: i32,
+                                                    ceiling: *u8) -> i32
+extern "git_repository_free" repository_free(r: *Repository)
+extern "git_repository_state" repository_state(r: *Repository) -> i32
+extern "git_repository_state_cleanup" repository_state_cleanup(r: *Repository) -> i32
+extern "git_repository_head" repository_head(out: **Reference, r: *Repository) -> i32
+extern "git_repository_head_unborn" repository_head_unborn(r: *Repository) -> i32
+extern "git_repository_head_detached" repository_head_detached(r: *Repository) -> i32
+extern "git_repository_is_empty" repository_is_empty(r: *Repository) -> i32
+extern "git_repository_is_bare" repository_is_bare(r: *Repository) -> i32
+extern "git_repository_workdir" repository_workdir(r: *Repository) -> *u8
+extern "git_repository_path" repository_path(r: *Repository) -> *u8
+extern "git_repository_index" repository_index(out: **Index, r: *Repository) -> i32
+extern "git_repository_config" repository_config(out: **Config, r: *Repository) -> i32
+extern "git_repository_set_head" repository_set_head(r: *Repository, refname: *u8) -> i32
+extern "git_repository_set_head_detached" repository_set_head_detached(r: *Repository,
+                                                                      id: *Oid) -> i32
+extern "git_clone" clone(out: **Repository, url: *u8, local_path: *u8, opts: *u8) -> i32
+extern "git_clone_options_init" clone_options_init(opts: *u8, version: u32) -> i32
+
+// ## Object ids
+
+extern "git_oid_fromstrn" oid_fromstrn(out: *Oid, s: *u8, n: usize) -> i32
+extern "git_oid_fmt" oid_fmt(out: *u8, id: *Oid) -> i32
+extern "git_oid_cmp" oid_cmp(a: *Oid, b: *Oid) -> i32
+
+// ## Objects
+
+extern "git_object_lookup" object_lookup(out: **Object, r: *Repository, id: *Oid, kind: i32) -> i32
+extern "git_object_free" object_free(o: *Object)
+extern "git_object_id" object_id(o: *Object) -> *Oid
+extern "git_object_type" object_type(o: *Object) -> i32
+extern "git_object_peel" object_peel(out: **Object, o: *Object, kind: i32) -> i32
+extern "git_revparse_single" revparse_single(out: **Object, r: *Repository, spec: *u8) -> i32
+
+// ## Signatures
+
+extern "git_signature_new" signature_new(out: **Signature, name: *u8, email: *u8, time: i64,
+                                        offset: i32) -> i32
+extern "git_signature_now" signature_now(out: **Signature, name: *u8, email: *u8) -> i32
+extern "git_signature_free" signature_free(s: *Signature)
+
+// ## Commits
+
+extern "git_commit_lookup" commit_lookup(out: **Commit, r: *Repository, id: *Oid) -> i32
+extern "git_commit_free" commit_free(c: *Commit)
+extern "git_commit_id" commit_id(c: *Commit) -> *Oid
+extern "git_commit_message" commit_message(c: *Commit) -> *u8
+extern "git_commit_summary" commit_summary(c: *Commit) -> *u8
+extern "git_commit_author" commit_author(c: *Commit) -> *Signature
+extern "git_commit_committer" commit_committer(c: *Commit) -> *Signature
+extern "git_commit_tree" commit_tree(out: **Tree, c: *Commit) -> i32
+extern "git_commit_tree_id" commit_tree_id(c: *Commit) -> *Oid
+extern "git_commit_parentcount" commit_parentcount(c: *Commit) -> u32
+extern "git_commit_parent_id" commit_parent_id(c: *Commit, n: u32) -> *Oid
+extern "git_commit_create" commit_create(id: *Oid, r: *Repository, update_ref: *u8,
+                                        author: *Signature, committer: *Signature, encoding: *u8,
+                                        message: *u8, tree: *Tree, parent_count: usize,
+                                        parents: **Commit) -> i32
+
+// ## Trees and blobs
+
+extern "git_tree_lookup" tree_lookup(out: **Tree, r: *Repository, id: *Oid) -> i32
+extern "git_tree_free" tree_free(t: *Tree)
+extern "git_tree_id" tree_id(t: *Tree) -> *Oid
+extern "git_tree_entrycount" tree_entrycount(t: *Tree) -> usize
+extern "git_tree_entry_byindex" tree_entry_byindex(t: *Tree, i: usize) -> *TreeEntry
+extern "git_tree_entry_byname" tree_entry_byname(t: *Tree, name: *u8) -> *TreeEntry
+extern "git_tree_entry_name" tree_entry_name(e: *TreeEntry) -> *u8
+extern "git_tree_entry_id" tree_entry_id(e: *TreeEntry) -> *Oid
+extern "git_tree_entry_type" tree_entry_type(e: *TreeEntry) -> i32
+extern "git_tree_entry_filemode" tree_entry_filemode(e: *TreeEntry) -> i32
+extern "git_treebuilder_new" treebuilder_new(out: **TreeBuilder, r: *Repository, source: *Tree) -> i32
+extern "git_treebuilder_insert" treebuilder_insert(out: **TreeEntry, b: *TreeBuilder, name: *u8,
+                                                  id: *Oid, mode: i32) -> i32
+extern "git_treebuilder_remove" treebuilder_remove(b: *TreeBuilder, name: *u8) -> i32
+extern "git_treebuilder_entrycount" treebuilder_entrycount(b: *TreeBuilder) -> usize
+extern "git_treebuilder_write" treebuilder_write(id: *Oid, b: *TreeBuilder) -> i32
+extern "git_treebuilder_free" treebuilder_free(b: *TreeBuilder)
+extern "git_blob_create_from_buffer" blob_create_from_buffer(id: *Oid, r: *Repository, data: *u8,
+                                                            n: usize) -> i32
+extern "git_blob_lookup" blob_lookup(out: **Blob, r: *Repository, id: *Oid) -> i32
+extern "git_blob_free" blob_free(b: *Blob)
+extern "git_blob_rawcontent" blob_rawcontent(b: *Blob) -> *u8
+extern "git_blob_rawsize" blob_rawsize(b: *Blob) -> u64
+extern "git_blob_is_binary" blob_is_binary(b: *Blob) -> i32
+
+// ## The index
+
+extern "git_index_free" index_free(i: *Index)
+extern "git_index_read" index_read(i: *Index, force: i32) -> i32
+extern "git_index_write" index_write(i: *Index) -> i32
+extern "git_index_write_tree" index_write_tree(out: *Oid, i: *Index) -> i32
+extern "git_index_entrycount" index_entrycount(i: *Index) -> usize
+extern "git_index_add_bypath" index_add_bypath(i: *Index, p: *u8) -> i32
+extern "git_index_remove_bypath" index_remove_bypath(i: *Index, p: *u8) -> i32
+extern "git_index_add_all" index_add_all(i: *Index, pathspec: *StrArray, flags: u32, cb: *u8,
+                                        payload: *u8) -> i32
+extern "git_index_get_bypath" index_get_bypath(i: *Index, p: *u8, stage: i32) -> *IndexEntry
+extern "git_index_has_conflicts" index_has_conflicts(i: *Index) -> i32
+
+// ## References and branches
+
+extern "git_reference_lookup" reference_lookup(out: **Reference, r: *Repository, name: *u8) -> i32
+extern "git_reference_free" reference_free(x: *Reference)
+extern "git_reference_name" reference_name(x: *Reference) -> *u8
+extern "git_reference_shorthand" reference_shorthand(x: *Reference) -> *u8
+extern "git_reference_target" reference_target(x: *Reference) -> *Oid
+extern "git_reference_symbolic_target" reference_symbolic_target(x: *Reference) -> *u8
+extern "git_reference_type" reference_type(x: *Reference) -> i32
+extern "git_reference_resolve" reference_resolve(out: **Reference, x: *Reference) -> i32
+extern "git_reference_name_to_id" reference_name_to_id(out: *Oid, r: *Repository, name: *u8) -> i32
+extern "git_reference_create" reference_create(out: **Reference, r: *Repository, name: *u8, id: *Oid,
+                                              force: i32, log_message: *u8) -> i32
+extern "git_reference_symbolic_create" reference_symbolic_create(out: **Reference, r: *Repository,
+                                                                name: *u8, target: *u8, force: i32,
+                                                                log_message: *u8) -> i32
+extern "git_reference_delete" reference_delete(x: *Reference) -> i32
+extern "git_reference_list" reference_list(out: *StrArray, r: *Repository) -> i32
+extern "git_branch_create" branch_create(out: **Reference, r: *Repository, name: *u8,
+                                        target: *Commit, force: i32) -> i32
+extern "git_branch_lookup" branch_lookup(out: **Reference, r: *Repository, name: *u8,
+                                        kind: i32) -> i32
+extern "git_branch_delete" branch_delete(x: *Reference) -> i32
+extern "git_branch_name" branch_name(out: **u8, x: *Reference) -> i32
+extern "git_branch_is_head" branch_is_head(x: *Reference) -> i32
+extern "git_branch_iterator_new" branch_iterator_new(out: **BranchIterator, r: *Repository,
+                                                    kind: i32) -> i32
+extern "git_branch_next" branch_next(out: **Reference, kind: *i32, it: *BranchIterator) -> i32
+extern "git_branch_iterator_free" branch_iterator_free(it: *BranchIterator)
+extern "git_strarray_dispose" strarray_dispose(a: *StrArray)
+
+// ## Checkout
+
+extern "git_checkout_options_init" checkout_options_init(opts: *CheckoutOptions, version: u32) -> i32
+extern "git_checkout_tree" checkout_tree(r: *Repository, treeish: *Object,
+                                        opts: *CheckoutOptions) -> i32
+extern "git_checkout_head" checkout_head(r: *Repository, opts: *CheckoutOptions) -> i32
+
+// ## Revwalk
+
+extern "git_revwalk_new" revwalk_new(out: **Revwalk, r: *Repository) -> i32
+extern "git_revwalk_free" revwalk_free(w: *Revwalk)
+extern "git_revwalk_push" revwalk_push(w: *Revwalk, id: *Oid) -> i32
+extern "git_revwalk_push_head" revwalk_push_head(w: *Revwalk) -> i32
+extern "git_revwalk_push_ref" revwalk_push_ref(w: *Revwalk, refname: *u8) -> i32
+extern "git_revwalk_hide" revwalk_hide(w: *Revwalk, id: *Oid) -> i32
+extern "git_revwalk_sorting" revwalk_sorting(w: *Revwalk, mode: u32) -> i32
+extern "git_revwalk_next" revwalk_next(out: *Oid, w: *Revwalk) -> i32
+
+// ## Diff and patch
+
+extern "git_diff_options_init" diff_options_init(opts: *DiffOptions, version: u32) -> i32
+extern "git_diff_tree_to_tree" diff_tree_to_tree(out: **Diff, r: *Repository, old: *Tree, new: *Tree,
+                                                opts: *DiffOptions) -> i32
+extern "git_diff_tree_to_index" diff_tree_to_index(out: **Diff, r: *Repository, old: *Tree,
+                                                  i: *Index, opts: *DiffOptions) -> i32
+extern "git_diff_index_to_workdir" diff_index_to_workdir(out: **Diff, r: *Repository, i: *Index,
+                                                        opts: *DiffOptions) -> i32
+extern "git_diff_free" diff_free(d: *Diff)
+extern "git_diff_num_deltas" diff_num_deltas(d: *Diff) -> usize
+extern "git_diff_get_delta" diff_get_delta(d: *Diff, i: usize) -> *DiffDelta
+extern "git_diff_foreach" diff_foreach(d: *Diff, file_cb: DiffFileCb, binary_cb: DiffBinaryCb,
+                                      hunk_cb: DiffHunkCb, line_cb: DiffLineCb, payload: *u8) -> i32
+extern "git_diff_to_buf" diff_to_buf(out: *Buf, d: *Diff, format: i32) -> i32
+extern "git_patch_from_diff" patch_from_diff(out: **Patch, d: *Diff, i: usize) -> i32
+extern "git_patch_to_buf" patch_to_buf(out: *Buf, p: *Patch) -> i32
+extern "git_patch_free" patch_free(p: *Patch)
+extern "git_buf_dispose" buf_dispose(b: *Buf)
+
+// ## Status
+
+extern "git_status_options_init" status_options_init(opts: *StatusOptions, version: u32) -> i32
+extern "git_status_foreach_ext" status_foreach_ext(r: *Repository, opts: *StatusOptions, cb: StatusCb,
+                                                  payload: *u8) -> i32
+extern "git_status_file" status_file(out: *u32, r: *Repository, p: *u8) -> i32
+
+// ## Blame
+
+extern "git_blame_options_init" blame_options_init(opts: *BlameOptions, version: u32) -> i32
+extern "git_blame_file" blame_file(out: **Blame, r: *Repository, p: *u8, opts: *BlameOptions) -> i32
+extern "git_blame_free" blame_free(b: *Blame)
+extern "git_blame_get_hunk_count" blame_get_hunk_count(b: *Blame) -> u32
+extern "git_blame_get_hunk_byindex" blame_get_hunk_byindex(b: *Blame, i: u32) -> *BlameHunk
+
+// ## Tags
+
+extern "git_tag_create" tag_create(out: *Oid, r: *Repository, name: *u8, target: *Object,
+                                  tagger: *Signature, message: *u8, force: i32) -> i32
+extern "git_tag_create_lightweight" tag_create_lightweight(out: *Oid, r: *Repository, name: *u8,
+                                                          target: *Object, force: i32) -> i32
+extern "git_tag_lookup" tag_lookup(out: **Tag, r: *Repository, id: *Oid) -> i32
+extern "git_tag_free" tag_free(t: *Tag)
+extern "git_tag_name" tag_name(t: *Tag) -> *u8
+extern "git_tag_message" tag_message(t: *Tag) -> *u8
+extern "git_tag_target_id" tag_target_id(t: *Tag) -> *Oid
+extern "git_tag_tagger" tag_tagger(t: *Tag) -> *Signature
+extern "git_tag_list" tag_list(out: *StrArray, r: *Repository) -> i32
+extern "git_tag_delete" tag_delete(r: *Repository, name: *u8) -> i32
+extern "git_tag_foreach" tag_foreach(r: *Repository, cb: TagForeachCb, payload: *u8) -> i32
+
+// ## Config
+
+extern "git_config_open_ondisk" config_open_ondisk(out: **Config, p: *u8) -> i32
+extern "git_config_free" config_free(c: *Config)
+extern "git_config_get_string_buf" config_get_string_buf(out: *Buf, c: *Config, name: *u8) -> i32
+extern "git_config_set_string" config_set_string(c: *Config, name: *u8, value: *u8) -> i32
+extern "git_config_get_int64" config_get_int64(out: *i64, c: *Config, name: *u8) -> i32
+extern "git_config_set_int64" config_set_int64(c: *Config, name: *u8, value: i64) -> i32
+extern "git_config_get_bool" config_get_bool(out: *i32, c: *Config, name: *u8) -> i32
+extern "git_config_set_bool" config_set_bool(c: *Config, name: *u8, value: i32) -> i32
+extern "git_config_delete_entry" config_delete_entry(c: *Config, name: *u8) -> i32
+
+// ## Stash
+
+extern "git_stash_save" stash_save(out: *Oid, r: *Repository, stasher: *Signature, message: *u8,
+                                  flags: u32) -> i32
+extern "git_stash_apply_options_init" stash_apply_options_init(opts: *StashApplyOptions,
+                                                              version: u32) -> i32
+extern "git_stash_apply" stash_apply(r: *Repository, i: usize, opts: *StashApplyOptions) -> i32
+extern "git_stash_pop" stash_pop(r: *Repository, i: usize, opts: *StashApplyOptions) -> i32
+extern "git_stash_drop" stash_drop(r: *Repository, i: usize) -> i32
+extern "git_stash_foreach" stash_foreach(r: *Repository, cb: StashCb, payload: *u8) -> i32
+
+// ## Credentials
+
+extern "git_credential_userpass_plaintext_new" credential_userpass_plaintext_new(
+    out: **Credential, user: *u8, pass: *u8) -> i32
+extern "git_credential_ssh_key_from_agent" credential_ssh_key_from_agent(out: **Credential,
+                                                                        user: *u8) -> i32
+extern "git_credential_default_new" credential_default_new(out: **Credential) -> i32
+extern "git_credential_get_username" credential_get_username(c: *Credential) -> *u8
+extern "git_credential_free" credential_free(c: *Credential)
+
+c const
+    OID_SIZE: usize = "sizeof(git_oid)"
+    TIME_SIZE: usize = "sizeof(git_time)"
+    SIGNATURE_SIZE: usize = "sizeof(git_signature)"
+    ERROR_SIZE: usize = "sizeof(git_error)"
+    BUF_SIZE: usize = "sizeof(git_buf)"
+    STRARRAY_SIZE: usize = "sizeof(git_strarray)"
+    CHECKOUT_OPTIONS_SIZE: usize = "sizeof(git_checkout_options)"
+    STATUS_OPTIONS_SIZE: usize = "sizeof(git_status_options)"
+    DIFF_OPTIONS_SIZE: usize = "sizeof(git_diff_options)"
+    DIFF_FILE_SIZE: usize = "sizeof(git_diff_file)"
+    DIFF_DELTA_SIZE: usize = "sizeof(git_diff_delta)"
+    DIFF_HUNK_SIZE: usize = "sizeof(git_diff_hunk)"
+    DIFF_LINE_SIZE: usize = "sizeof(git_diff_line)"
+    BLAME_OPTIONS_SIZE: usize = "sizeof(git_blame_options)"
+    BLAME_HUNK_SIZE: usize = "sizeof(git_blame_hunk)"
+    STASH_APPLY_OPTIONS_SIZE: usize = "sizeof(git_stash_apply_options)"
+    INDEXER_PROGRESS_SIZE: usize = "sizeof(git_indexer_progress)"
+    OFFSET_HUNK_HEADER: usize = "offsetof(git_diff_hunk, header)"
+    OFFSET_LINE_CONTENT: usize = "offsetof(git_diff_line, content)"
+    OFFSET_BLAME_SUMMARY: usize = "offsetof(git_blame_hunk, summary)"
+    OFFSET_STASH_CHECKOUT: usize = "offsetof(git_stash_apply_options, checkout_options)"
+
+    // Each options struct is filled by its `_init` function in storage of this many 8-byte words.
+    CHECKOUT_OPTIONS_WORDS: usize = "(sizeof(git_checkout_options) + 7) / 8"
+    STATUS_OPTIONS_WORDS: usize = "(sizeof(git_status_options) + 7) / 8"
+    DIFF_OPTIONS_WORDS: usize = "(sizeof(git_diff_options) + 7) / 8"
+    BLAME_OPTIONS_WORDS: usize = "(sizeof(git_blame_options) + 7) / 8"
+    STASH_APPLY_OPTIONS_WORDS: usize = "(sizeof(git_stash_apply_options) + 7) / 8"
+
+    // `git_clone_options`, as storage the header sizes and the four fields this binding writes.
+    CLONE_OPTIONS_WORDS: usize = "(sizeof(git_clone_options) + 7) / 8"
+    CLONE_OPTIONS_ALIGN: usize = "_Alignof(git_clone_options)"
+    CLONE_BARE: usize = "offsetof(git_clone_options, bare)"
+    CLONE_CHECKOUT_BRANCH: usize = "offsetof(git_clone_options, checkout_branch)"
+    CLONE_CHECKOUT_OPTS: usize = "offsetof(git_clone_options, checkout_opts)"
+    CLONE_CREDENTIALS: usize = "offsetof(git_clone_options, fetch_opts.callbacks.credentials)"
+    CLONE_TRANSFER_PROGRESS: usize = "offsetof(git_clone_options, fetch_opts.callbacks.transfer_progress)"
+    CLONE_CALLBACKS_PAYLOAD: usize = "offsetof(git_clone_options, fetch_opts.callbacks.payload)"
+
+    CHECKOUT_OPTIONS_VERSION: u32 = "GIT_CHECKOUT_OPTIONS_VERSION"
+    STATUS_OPTIONS_VERSION: u32 = "GIT_STATUS_OPTIONS_VERSION"
+    DIFF_OPTIONS_VERSION: u32 = "GIT_DIFF_OPTIONS_VERSION"
+    BLAME_OPTIONS_VERSION: u32 = "GIT_BLAME_OPTIONS_VERSION"
+    STASH_APPLY_OPTIONS_VERSION: u32 = "GIT_STASH_APPLY_OPTIONS_VERSION"
+    CLONE_OPTIONS_VERSION: u32 = "GIT_CLONE_OPTIONS_VERSION"
+
+    // `git_error_code`.
+    OK: i32 = "GIT_OK"
+    ERROR: i32 = "GIT_ERROR"
+    ENOTFOUND: i32 = "GIT_ENOTFOUND"
+    EEXISTS: i32 = "GIT_EEXISTS"
+    EAMBIGUOUS: i32 = "GIT_EAMBIGUOUS"
+    EBUFS: i32 = "GIT_EBUFS"
+    EUSER: i32 = "GIT_EUSER"
+    EBAREREPO: i32 = "GIT_EBAREREPO"
+    EUNBORNBRANCH: i32 = "GIT_EUNBORNBRANCH"
+    EUNMERGED: i32 = "GIT_EUNMERGED"
+    ENONFASTFORWARD: i32 = "GIT_ENONFASTFORWARD"
+    EINVALIDSPEC: i32 = "GIT_EINVALIDSPEC"
+    ECONFLICT: i32 = "GIT_ECONFLICT"
+    ELOCKED: i32 = "GIT_ELOCKED"
+    EMODIFIED: i32 = "GIT_EMODIFIED"
+    EAUTH: i32 = "GIT_EAUTH"
+    ECERTIFICATE: i32 = "GIT_ECERTIFICATE"
+    EAPPLIED: i32 = "GIT_EAPPLIED"
+    EPEEL: i32 = "GIT_EPEEL"
+    EEOF: i32 = "GIT_EEOF"
+    EINVALID: i32 = "GIT_EINVALID"
+    EUNCOMMITTED: i32 = "GIT_EUNCOMMITTED"
+    EDIRECTORY: i32 = "GIT_EDIRECTORY"
+    EMERGECONFLICT: i32 = "GIT_EMERGECONFLICT"
+    PASSTHROUGH: i32 = "GIT_PASSTHROUGH"
+    ITEROVER: i32 = "GIT_ITEROVER"
+    EOWNER: i32 = "GIT_EOWNER"
+    ENOTSUPPORTED: i32 = "GIT_ENOTSUPPORTED"
+    EREADONLY: i32 = "GIT_EREADONLY"
+
+    // `git_error_t`: numbered from zero without gaps, which `error.sysl`'s table relies on and
+    // `tests.sysl` checks at both ends.
+    ERROR_NONE: i32 = "GIT_ERROR_NONE"
+    ERROR_REPOSITORY: i32 = "GIT_ERROR_REPOSITORY"
+    ERROR_REFERENCE: i32 = "GIT_ERROR_REFERENCE"
+    ERROR_CHECKOUT: i32 = "GIT_ERROR_CHECKOUT"
+    ERROR_CALLBACK: i32 = "GIT_ERROR_CALLBACK"
+    ERROR_GRAFTS: i32 = "GIT_ERROR_GRAFTS"
+
+    OBJECT_ANY: i32 = "GIT_OBJECT_ANY"
+    OBJECT_INVALID: i32 = "GIT_OBJECT_INVALID"
+    OBJECT_COMMIT: i32 = "GIT_OBJECT_COMMIT"
+    OBJECT_TREE: i32 = "GIT_OBJECT_TREE"
+    OBJECT_BLOB: i32 = "GIT_OBJECT_BLOB"
+    OBJECT_TAG: i32 = "GIT_OBJECT_TAG"
+
+    FILEMODE_TREE: i32 = "GIT_FILEMODE_TREE"
+    FILEMODE_BLOB: i32 = "GIT_FILEMODE_BLOB"
+    FILEMODE_BLOB_EXECUTABLE: i32 = "GIT_FILEMODE_BLOB_EXECUTABLE"
+    FILEMODE_LINK: i32 = "GIT_FILEMODE_LINK"
+    FILEMODE_COMMIT: i32 = "GIT_FILEMODE_COMMIT"
+
+    REFERENCE_DIRECT: i32 = "GIT_REFERENCE_DIRECT"
+    REFERENCE_SYMBOLIC: i32 = "GIT_REFERENCE_SYMBOLIC"
+
+    BRANCH_LOCAL: i32 = "GIT_BRANCH_LOCAL"
+    BRANCH_REMOTE: i32 = "GIT_BRANCH_REMOTE"
+    BRANCH_ALL: i32 = "GIT_BRANCH_ALL"
+
+    REPOSITORY_OPEN_NO_SEARCH: u32 = "GIT_REPOSITORY_OPEN_NO_SEARCH"
+
+    OPT_SET_SEARCH_PATH: i32 = "GIT_OPT_SET_SEARCH_PATH"
+    CONFIG_LEVEL_PROGRAMDATA: i32 = "GIT_CONFIG_LEVEL_PROGRAMDATA"
+    CONFIG_LEVEL_SYSTEM: i32 = "GIT_CONFIG_LEVEL_SYSTEM"
+    CONFIG_LEVEL_XDG: i32 = "GIT_CONFIG_LEVEL_XDG"
+    CONFIG_LEVEL_GLOBAL: i32 = "GIT_CONFIG_LEVEL_GLOBAL"
+
+    REPOSITORY_STATE_NONE: i32 = "GIT_REPOSITORY_STATE_NONE"
+    REPOSITORY_STATE_MERGE: i32 = "GIT_REPOSITORY_STATE_MERGE"
+    REPOSITORY_STATE_REVERT: i32 = "GIT_REPOSITORY_STATE_REVERT"
+    REPOSITORY_STATE_REVERT_SEQUENCE: i32 = "GIT_REPOSITORY_STATE_REVERT_SEQUENCE"
+    REPOSITORY_STATE_CHERRYPICK: i32 = "GIT_REPOSITORY_STATE_CHERRYPICK"
+    REPOSITORY_STATE_CHERRYPICK_SEQUENCE: i32 = "GIT_REPOSITORY_STATE_CHERRYPICK_SEQUENCE"
+    REPOSITORY_STATE_BISECT: i32 = "GIT_REPOSITORY_STATE_BISECT"
+    REPOSITORY_STATE_REBASE: i32 = "GIT_REPOSITORY_STATE_REBASE"
+    REPOSITORY_STATE_REBASE_INTERACTIVE: i32 = "GIT_REPOSITORY_STATE_REBASE_INTERACTIVE"
+    REPOSITORY_STATE_REBASE_MERGE: i32 = "GIT_REPOSITORY_STATE_REBASE_MERGE"
+    REPOSITORY_STATE_APPLY_MAILBOX: i32 = "GIT_REPOSITORY_STATE_APPLY_MAILBOX"
+    REPOSITORY_STATE_APPLY_MAILBOX_OR_REBASE: i32 = "GIT_REPOSITORY_STATE_APPLY_MAILBOX_OR_REBASE"
+
+    SORT_NONE: u32 = "GIT_SORT_NONE"
+    SORT_TOPOLOGICAL: u32 = "GIT_SORT_TOPOLOGICAL"
+    SORT_TIME: u32 = "GIT_SORT_TIME"
+    SORT_REVERSE: u32 = "GIT_SORT_REVERSE"
+
+    CHECKOUT_SAFE: u32 = "GIT_CHECKOUT_SAFE"
+    CHECKOUT_FORCE: u32 = "GIT_CHECKOUT_FORCE"
+
+    DIFF_FORMAT_PATCH: i32 = "GIT_DIFF_FORMAT_PATCH"
+    DIFF_INCLUDE_UNTRACKED: u32 = "GIT_DIFF_INCLUDE_UNTRACKED"
+    DIFF_SHOW_UNTRACKED_CONTENT: u32 = "GIT_DIFF_SHOW_UNTRACKED_CONTENT"
+    DIFF_RECURSE_UNTRACKED_DIRS: u32 = "GIT_DIFF_RECURSE_UNTRACKED_DIRS"
+
+    DELTA_UNMODIFIED: i32 = "GIT_DELTA_UNMODIFIED"
+    DELTA_ADDED: i32 = "GIT_DELTA_ADDED"
+    DELTA_DELETED: i32 = "GIT_DELTA_DELETED"
+    DELTA_MODIFIED: i32 = "GIT_DELTA_MODIFIED"
+    DELTA_RENAMED: i32 = "GIT_DELTA_RENAMED"
+    DELTA_COPIED: i32 = "GIT_DELTA_COPIED"
+    DELTA_IGNORED: i32 = "GIT_DELTA_IGNORED"
+    DELTA_UNTRACKED: i32 = "GIT_DELTA_UNTRACKED"
+    DELTA_TYPECHANGE: i32 = "GIT_DELTA_TYPECHANGE"
+    DELTA_UNREADABLE: i32 = "GIT_DELTA_UNREADABLE"
+    DELTA_CONFLICTED: i32 = "GIT_DELTA_CONFLICTED"
+
+    STATUS_SHOW_INDEX_AND_WORKDIR: i32 = "GIT_STATUS_SHOW_INDEX_AND_WORKDIR"
+    STATUS_OPT_INCLUDE_UNTRACKED: u32 = "GIT_STATUS_OPT_INCLUDE_UNTRACKED"
+    STATUS_OPT_RECURSE_UNTRACKED_DIRS: u32 = "GIT_STATUS_OPT_RECURSE_UNTRACKED_DIRS"
+    STATUS_OPT_INCLUDE_IGNORED: u32 = "GIT_STATUS_OPT_INCLUDE_IGNORED"
+    STATUS_OPT_RENAMES_HEAD_TO_INDEX: u32 = "GIT_STATUS_OPT_RENAMES_HEAD_TO_INDEX"
+    STATUS_OPT_SORT_CASE_SENSITIVELY: u32 = "GIT_STATUS_OPT_SORT_CASE_SENSITIVELY"
+    STATUS_INDEX_NEW: u32 = "GIT_STATUS_INDEX_NEW"
+    STATUS_INDEX_MODIFIED: u32 = "GIT_STATUS_INDEX_MODIFIED"
+    STATUS_INDEX_DELETED: u32 = "GIT_STATUS_INDEX_DELETED"
+    STATUS_INDEX_RENAMED: u32 = "GIT_STATUS_INDEX_RENAMED"
+    STATUS_INDEX_TYPECHANGE: u32 = "GIT_STATUS_INDEX_TYPECHANGE"
+    STATUS_WT_NEW: u32 = "GIT_STATUS_WT_NEW"
+    STATUS_WT_MODIFIED: u32 = "GIT_STATUS_WT_MODIFIED"
+    STATUS_WT_DELETED: u32 = "GIT_STATUS_WT_DELETED"
+    STATUS_WT_TYPECHANGE: u32 = "GIT_STATUS_WT_TYPECHANGE"
+    STATUS_WT_RENAMED: u32 = "GIT_STATUS_WT_RENAMED"
+    STATUS_IGNORED: u32 = "GIT_STATUS_IGNORED"
+    STATUS_CONFLICTED: u32 = "GIT_STATUS_CONFLICTED"
+
+    STASH_DEFAULT: u32 = "GIT_STASH_DEFAULT"
+    STASH_INCLUDE_UNTRACKED: u32 = "GIT_STASH_INCLUDE_UNTRACKED"
+
+    CREDENTIAL_USERPASS_PLAINTEXT: u32 = "GIT_CREDENTIAL_USERPASS_PLAINTEXT"
+    CREDENTIAL_SSH_KEY: u32 = "GIT_CREDENTIAL_SSH_KEY"
+    CREDENTIAL_DEFAULT: u32 = "GIT_CREDENTIAL_DEFAULT"
+
+// Every struct this side lays out is the size and shape the header gives it, checked at compile time:
+// a libgit2 that grows a field stops the build here rather than corrupting a call.
+@assert(sizeof(Oid) == OID_SIZE, "git_oid is not the size libgit2 says it is")
+@assert(sizeof(Time) == TIME_SIZE, "git_time is not the size libgit2 says it is")
+@assert(sizeof(Signature) == SIGNATURE_SIZE, "git_signature is not the size libgit2 says it is")
+@assert(sizeof(Error) == ERROR_SIZE, "git_error is not the size libgit2 says it is")
+@assert(sizeof(Buf) == BUF_SIZE, "git_buf is not the size libgit2 says it is")
+@assert(sizeof(StrArray) == STRARRAY_SIZE, "git_strarray is not the size libgit2 says it is")
+@assert(sizeof(CheckoutOptions) == CHECKOUT_OPTIONS_SIZE, "git_checkout_options is not the size libgit2 says it is")
+@assert(sizeof(StatusOptions) == STATUS_OPTIONS_SIZE, "git_status_options is not the size libgit2 says it is")
+@assert(sizeof(DiffOptions) == DIFF_OPTIONS_SIZE, "git_diff_options is not the size libgit2 says it is")
+@assert(sizeof(DiffFile) == DIFF_FILE_SIZE, "git_diff_file is not the size libgit2 says it is")
+@assert(sizeof(DiffDelta) == DIFF_DELTA_SIZE, "git_diff_delta is not the size libgit2 says it is")
+@assert(sizeof(DiffHunk) == DIFF_HUNK_SIZE, "git_diff_hunk is not the size libgit2 says it is")
+@assert(sizeof(DiffLine) == DIFF_LINE_SIZE, "git_diff_line is not the size libgit2 says it is")
+@assert(sizeof(BlameOptions) == BLAME_OPTIONS_SIZE, "git_blame_options is not the size libgit2 says it is")
+@assert(sizeof(BlameHunk) == BLAME_HUNK_SIZE, "git_blame_hunk is not the size libgit2 says it is")
+@assert(sizeof(StashApplyOptions) == STASH_APPLY_OPTIONS_SIZE, "git_stash_apply_options is not the size libgit2 says it is")
+@assert(sizeof(IndexerProgress) == INDEXER_PROGRESS_SIZE, "git_indexer_progress is not the size libgit2 says it is")
+@assert(offsetof(DiffHunk, header) == OFFSET_HUNK_HEADER, "git_diff_hunk.header is not where libgit2 puts it")
+@assert(offsetof(DiffLine, content) == OFFSET_LINE_CONTENT, "git_diff_line.content is not where libgit2 puts it")
+@assert(offsetof(BlameHunk, summary) == OFFSET_BLAME_SUMMARY, "git_blame_hunk.summary is not where libgit2 puts it")
+@assert(offsetof(StashApplyOptions, checkout_options) == OFFSET_STASH_CHECKOUT, "git_stash_apply_options.checkout_options is not where libgit2 puts it")
+@assert(CLONE_OPTIONS_ALIGN <= 8, "git_clone_options wants more than the 8-byte alignment its u64 storage gives")

@@ -1,0 +1,50 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.text.cstring
+
+/** The index: the staging area a commit is made from. Changes are in memory until [write].
+ *
+ * **A repository keeps the index it loaded**, so where another process (`git merge`, `git add`)
+ * rewrote `.git/index` since, [read] is what brings this one up to date. */
+struct Index
+    private[libgit2] raw: *c.Index
+    private[libgit2] repo: &Repository
+
+    /** How many entries (files, and conflict stages). */
+    len(self) -> usize = c.index_entrycount(self.raw)
+
+    /** Stage the working tree's `path`, relative to the working tree's root. */
+    add(self, path: string) -> Result[unit, Error] =
+        check(c.index_add_bypath(self.raw, cstring(path).ptr))
+
+    /** Stage everything in the working tree that is not ignored (`git add -A .`). */
+    add_all(self) -> Result[unit, Error] = check(c.index_add_all(self.raw, null, 0, null, null))
+
+    /** Unstage `path`: remove it from the index (`git rm --cached`). */
+    remove(self, path: string) -> Result[unit, Error] =
+        check(c.index_remove_bypath(self.raw, cstring(path).ptr))
+
+    /** Whether `path` is in the index at stage 0. */
+    contains(self, path: string) -> bool = c.index_get_bypath(self.raw, cstring(path).ptr, 0) != null
+
+    /** Whether any path is in conflict. */
+    has_conflicts(self) -> bool = c.index_has_conflicts(self.raw) == 1
+
+    /** Reread the index file, dropping changes made in memory where `force`. */
+    read(self, force: bool = false) -> Result[unit, Error] =
+        check(c.index_read(self.raw, if force then 1 else 0))
+
+    /** Write the index back to `.git/index`. */
+    write(self) -> Result[unit, Error] = check(c.index_write(self.raw))
+
+    /** Write the index's contents as a tree object and answer its id — what a commit records. */
+    write_tree(self) -> Result[Oid, Error]
+        var out = c.Oid([0; 20])
+
+        check(c.index_write_tree(&out, self.raw))?
+        Ok(Oid(out))
+end Index
+
+impl Drop for Index
+    drop(self) = c.index_free(self.raw)

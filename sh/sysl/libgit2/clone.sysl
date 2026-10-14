@@ -1,0 +1,129 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.text.cstring
+
+/** How far a fetch has got: `git_indexer_progress`. */
+struct TransferProgress derives Eq, Display
+    total_objects: int
+    indexed_objects: int
+    received_objects: int
+    local_objects: int
+    total_deltas: int
+    indexed_deltas: int
+    received_bytes: usize
+
+/** What a remote asked for when it wanted credentials. */
+struct CredentialRequest
+    /** The URL being fetched from. */
+    url: string
+    /** The user name the URL carried (`git@` in `git@host:repo`), if any. */
+    username: Option[string]
+    /** The `git_credential_t` kinds the transport will accept, as bits. */
+    allowed: u32
+
+    /** Whether a user name and password will do (HTTPS). */
+    allows_password(self) -> bool = self.allowed & c.CREDENTIAL_USERPASS_PLAINTEXT != 0
+
+    /** Whether an SSH key will do. */
+    allows_ssh_key(self) -> bool = self.allowed & c.CREDENTIAL_SSH_KEY != 0
+
+    /** Whether the platform's default credentials will do (NTLM, Negotiate). */
+    allows_default(self) -> bool = self.allowed & c.CREDENTIAL_DEFAULT != 0
+
+/** A credential to answer a [CredentialRequest] with. */
+enum Credential derives Eq, Display
+    /** A user name and password, or a token in the password's place. */
+    Password(user: string, password: string)
+    /** Whatever key `ssh-agent` holds for `user`. */
+    SshAgent(user: string)
+    /** The platform's default credentials. */
+    DefaultCredential
+
+/** The closures a fetch reports to, boxed so `callbacks.payload` can point at them. */
+private[libgit2] struct RemoteWatch
+    transfer: Option[&Fn(TransferProgress) -> bool]
+    credentials: Option[&Fn(CredentialRequest) -> Option[Credential]]
+
+private transferred(stats: *c.IndexerProgress, payload: *u8) -> i32
+    val w: *RemoteWatch = ptr_cast(payload)
+
+    w.transfer match
+        Some(cb) ->
+            val p = TransferProgress(int(stats.total_objects), int(stats.indexed_objects),
+                                     int(stats.received_objects), int(stats.local_objects),
+                                     int(stats.total_deltas), int(stats.indexed_deltas),
+                                     stats.received_bytes)
+
+            if cb(p) then 0 else c.EUSER
+        None -> 0
+
+/** The function libgit2 calls when a remote wants credentials, answering with what the closure
+ * chose. `GIT_PASSTHROUGH` — "no answer from here" — where there is no closure or it answered
+ * `None`, which makes libgit2 report `Auth` for a remote that insists. */
+private[libgit2] credentials_asked(out: **c.Credential, url: *u8, username: *u8, allowed: u32,
+                                   payload: *u8) -> i32
+    val w: *RemoteWatch = ptr_cast(payload)
+    val cb = w.credentials match
+        Some(f) -> f
+        None -> return c.PASSTHROUGH
+    val request = CredentialRequest(text(url), maybe_text(username), allowed)
+
+    cb(request) match
+        Some(Password(user, password)) ->
+            c.credential_userpass_plaintext_new(out, cstring(user).ptr, cstring(password).ptr)
+        Some(SshAgent(user)) -> c.credential_ssh_key_from_agent(out, cstring(user).ptr)
+        Some(DefaultCredential) -> c.credential_default_new(out)
+        None -> c.PASSTHROUGH
+end credentials_asked
+
+/** Write `value` into the clone options at `offset`. */
+private put[T](store: *u64, offset: usize, value: T)
+    val p: *T = ptr_cast(usize(store) + offset)
+
+    *p = value
+
+/** `git clone <url> <dir>`. Over the network this needs libgit2's HTTPS or SSH transport; a
+ * `file://` URL or a plain path is cloned locally.
+ *
+ * `branch` checks out that branch rather than the remote's `HEAD`. `on_checkout` sees every file
+ * the checkout writes; `on_transfer` sees the fetch, and stops it by answering `false` (`User`).
+ * `credentials` is asked when a remote wants them — it is never asked for a local clone.
+ */
+clone(url: string, dir: string, bare: bool = false, branch: Option[string] = None,
+      on_checkout: Option[&Fn(CheckoutProgress) -> unit] = None,
+      on_transfer: Option[&Fn(TransferProgress) -> bool] = None,
+      credentials: Option[&Fn(CredentialRequest) -> Option[Credential]] = None) -> Result[&Repository, Error]
+    ensure_init()
+
+    var store: [c.CLONE_OPTIONS_WORDS]u64 = [0; c.CLONE_OPTIONS_WORDS]
+    val base: *u64 = &store[0]
+
+    check(c.clone_options_init(ptr_cast(base), c.CLONE_OPTIONS_VERSION))?
+
+    val checkout: *c.CheckoutOptions = ptr_cast(usize(base) + c.CLONE_CHECKOUT_OPTS)
+    val watch: Option[&CheckoutWatch] = on_checkout match
+        Some(f) -> Some(CheckoutWatch(f))
+        None -> None
+
+    fill_checkout(checkout, false, watch)
+
+    val remote: &RemoteWatch = RemoteWatch(on_transfer, credentials)
+    val transfer: c.IndexerProgressCb = &transferred
+    val asked: c.CredentialAcquireCb = &credentials_asked
+    val name = cstring(branch.unwrap_or(""))
+    val branch_ptr: *u8 = if branch.is_some() then name.ptr else null
+
+    put(base, c.CLONE_TRANSFER_PROGRESS, transfer)
+    put(base, c.CLONE_CREDENTIALS, asked)
+    val payload: *u8 = ptr_cast(&*remote)
+
+    put(base, c.CLONE_CALLBACKS_PAYLOAD, payload)
+    put(base, c.CLONE_BARE, if bare then 1i32 else 0i32)
+    put(base, c.CLONE_CHECKOUT_BRANCH, branch_ptr)
+
+    var out: *c.Repository = null
+
+    check(c.clone(&out, cstring(url).ptr, cstring(dir).ptr, ptr_cast(base)))?
+    Ok(Repository(out))
+end clone

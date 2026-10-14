@@ -1,0 +1,181 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.text.from_cstring
+
+/** What a failing libgit2 call answered: the `git_error_code` it returned. */
+enum Code derives Eq, Display
+    /** `GIT_ERROR`: a failure with no more specific code. */
+    Generic
+    /** `GIT_ENOTFOUND`: the object, reference, file or repository does not exist. */
+    NotFound
+    /** `GIT_EEXISTS`: the object or reference already exists. */
+    Exists
+    /** `GIT_EAMBIGUOUS`: a short id names more than one object. */
+    Ambiguous
+    /** `GIT_EBUFS`: an output buffer was too short. */
+    Buffers
+    /** `GIT_EUSER`: a callback asked for the operation to stop. */
+    User
+    /** `GIT_EBAREREPO`: the operation needs a working tree and the repository is bare. */
+    BareRepo
+    /** `GIT_EUNBORNBRANCH`: `HEAD` names a branch with no commits yet. */
+    UnbornBranch
+    /** `GIT_EUNMERGED`: a merge is in progress and stops the operation. */
+    Unmerged
+    /** `GIT_ENONFASTFORWARD`: a reference update is not a fast-forward. */
+    NonFastForward
+    /** `GIT_EINVALIDSPEC`: a name or revision spec is malformed. */
+    InvalidSpec
+    /** `GIT_ECONFLICT`: a checkout would overwrite changes in the working tree. */
+    Conflict
+    /** `GIT_ELOCKED`: a lock file is held by someone else. */
+    Locked
+    /** `GIT_EMODIFIED`: a reference changed since it was read. */
+    Modified
+    /** `GIT_EAUTH`: authentication failed. */
+    Auth
+    /** `GIT_ECERTIFICATE`: the server's certificate was refused. */
+    Certificate
+    /** `GIT_EAPPLIED`: the patch or merge has already been applied. */
+    Applied
+    /** `GIT_EPEEL`: an object cannot be peeled to the kind asked for. */
+    Peel
+    /** `GIT_EEOF`: unexpected end of input. */
+    Eof
+    /** `GIT_EINVALID`: invalid input. */
+    Invalid
+    /** `GIT_EUNCOMMITTED`: uncommitted changes in the index stop the operation. */
+    Uncommitted
+    /** `GIT_EDIRECTORY`: the operation is not valid for a directory. */
+    Directory
+    /** `GIT_EMERGECONFLICT`: a merge conflict exists and the operation cannot continue. */
+    MergeConflict
+    /** `GIT_EOWNER`: the repository is owned by another user. */
+    Owner
+    /** `GIT_ENOTSUPPORTED`: the operation is not supported. */
+    NotSupported
+    /** `GIT_EREADONLY`: the object is read-only. */
+    ReadOnly
+    /** A code this binding does not name, as libgit2 answered it. */
+    Other(code: int)
+end Code
+
+/** Which part of libgit2 reported an error: `git_error_t`, as its name without the prefix. */
+enum Class derives Eq, Display
+    None
+    NoMemory
+    Os
+    Invalid
+    Reference
+    Zlib
+    Repository
+    Config
+    Regex
+    Odb
+    Index
+    Object
+    Net
+    Tag
+    Tree
+    Indexer
+    Ssl
+    Submodule
+    Thread
+    Stash
+    Checkout
+    FetchHead
+    Merge
+    Ssh
+    Filter
+    Revert
+    Callback
+    Cherrypick
+    Describe
+    Rebase
+    Filesystem
+    Patch
+    Worktree
+    Sha
+    Http
+    Internal
+    Grafts
+    /** A class newer than this binding, as libgit2 answered it. */
+    Unknown(klass: int)
+end Class
+
+// `git_error_t` in order: the header numbers it from zero without gaps.
+private val CLASSES: [37]Class = [None, NoMemory, Os, Invalid, Reference, Zlib, Repository, Config,
+                                  Regex, Odb, Index, Object, Net, Tag, Tree, Indexer, Ssl, Submodule,
+                                  Thread, Stash, Checkout, FetchHead, Merge, Ssh, Filter, Revert,
+                                  Callback, Cherrypick, Describe, Rebase, Filesystem, Patch, Worktree,
+                                  Sha, Http, Internal, Grafts]
+
+/** A failed libgit2 call: the code it returned, and the class and message `git_error_last()` held
+ * when it returned. */
+struct Error derives Eq
+    code: Code
+    class: Class
+    message: string
+
+    /** `"<message>"`, as libgit2 wrote it. */
+    to_string(self) -> string = self.message
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
+
+private[libgit2] code_of(rc: i32) -> Code
+    if rc == c.ENOTFOUND then return NotFound
+    if rc == c.EEXISTS then return Exists
+    if rc == c.EAMBIGUOUS then return Ambiguous
+    if rc == c.EBUFS then return Buffers
+    if rc == c.EUSER then return User
+    if rc == c.EBAREREPO then return BareRepo
+    if rc == c.EUNBORNBRANCH then return UnbornBranch
+    if rc == c.EUNMERGED then return Unmerged
+    if rc == c.ENONFASTFORWARD then return NonFastForward
+    if rc == c.EINVALIDSPEC then return InvalidSpec
+    if rc == c.ECONFLICT then return Conflict
+    if rc == c.ELOCKED then return Locked
+    if rc == c.EMODIFIED then return Modified
+    if rc == c.EAUTH then return Auth
+    if rc == c.ECERTIFICATE then return Certificate
+    if rc == c.EAPPLIED then return Applied
+    if rc == c.EPEEL then return Peel
+    if rc == c.EEOF then return Eof
+    if rc == c.EINVALID then return Invalid
+    if rc == c.EUNCOMMITTED then return Uncommitted
+    if rc == c.EDIRECTORY then return Directory
+    if rc == c.EMERGECONFLICT then return MergeConflict
+    if rc == c.EOWNER then return Owner
+    if rc == c.ENOTSUPPORTED then return NotSupported
+    if rc == c.EREADONLY then return ReadOnly
+    if rc == c.ERROR then Generic else Other(rc)
+end code_of
+
+private[libgit2] class_of(klass: i32) -> Class =
+    if klass >= 0 && usize(klass) < CLASSES.len then CLASSES[usize(klass)] else Unknown(klass)
+
+/** The error libgit2 recorded for a call that answered `rc`. */
+private[libgit2] last_error(rc: i32) -> Error
+    val e = c.error_last()
+
+    if e == null then return Error(code_of(rc), None, "")
+
+    val message = text(e.message)
+
+    Error(code_of(rc), class_of(e.klass), message)
+
+/** A libgit2 return code read as a `Result`: negative is a failure, anything else is success. */
+private[libgit2] check(rc: i32) -> Result[unit, Error] = if rc < 0 then Err(last_error(rc)) else Ok(())
+
+/** A C string libgit2 owns, copied into a `string`; null reads as `""`. */
+private[libgit2] text(p: *u8) -> string = if p == null then "" else from_cstring(p).ok().unwrap_or("")
+
+/** A C string libgit2 owns, copied, or `None` where libgit2 answered null. */
+private[libgit2] maybe_text(p: *u8) -> Option[string] = if p == null then None else from_cstring(p).ok()
+
+/** Make sure libgit2's global state is set up. `git_libgit2_init` counts its callers and is cheap
+ * after the first, so every entry point that can be the first libgit2 call of a program makes it;
+ * nothing here ever shuts the library down, so the state lives until the process exits. */
+private[libgit2] ensure_init() = c.libgit2_init()

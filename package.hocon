@@ -1,0 +1,44 @@
+// libgit2 — git as a library, bound for sysl.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       libgit2 { git = "github.com/sysl-lang/libgit2", version = "0.1.0" }
+//     }
+//
+// **libgit2 has to be installed, and so do its headers.** Nothing is vendored: libgit2 is a large C
+// project with its own transports, hashing back ends and TLS, and a package carrying it would be
+// carrying a port rather than a binding.
+//
+//     brew install libgit2           # macOS
+//     sudo apt install libgit2-dev   # Debian / Ubuntu
+//
+// **libgit2 1.9 or newer**, the first release whose `git_commit_create` takes its parents as
+// `const git_commit *[]` with the layout `c/c.sysl` declares, and whose option structs the size
+// tests in `tests.sysl` were measured against.
+
+package {
+  name    = "libgit2"
+  version = "0.1.0"
+
+  // The compiler this was written and tested against.
+  sysl = "0.1.0-alpha.12"
+}
+
+// **`posix`, because git is files.** A repository is a directory, an index is a file, a checkout
+// writes a working tree; there is no freestanding target this works on.
+//
+// **`heap`, because every libgit2 object is a `&T`** whose destructor calls the matching
+// `git_*_free`, and every callback is a boxed closure.
+//
+// `posix` implies `os`, so that one is not written out.
+requires {
+  heap  = true
+  posix = true
+
+  // libgit2 installs `libgit2.pc` beside itself, so the headers `sh.sysl.libgit2.c` reads and the
+  // `-lgit2` the link line needs are found by asking rather than by a reader typing out a prefix.
+  pkg_config {
+    libgit2 = "libgit2 — `brew install libgit2` on macOS, Debian's libgit2-dev"
+  }
+}

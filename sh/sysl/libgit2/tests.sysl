@@ -1,0 +1,570 @@
+module sh.sysl.libgit2
+@tests
+
+// What this binding claims, run by `sysl test .`.
+//
+// **The oracle is the `git` command line**, run on the same repository in a scratch directory: a
+// commit the binding makes is read back by `git cat-file` and `git log`, a repository `git` made is
+// read by the binding, and diffs, status, blame, tags, branches, config and the stash are compared
+// with what `git` prints for them.
+//
+// **Neither side reads the user's configuration.** `git` runs with `GIT_CONFIG_GLOBAL=/dev/null` and
+// `GIT_CONFIG_NOSYSTEM=1`, and every test process points libgit2's global, XDG and system search paths
+// at an empty directory before its first call (`isolate`) — so a `core.excludesfile`, a hooks path or
+// an `init.defaultBranch` on the machine running the tests cannot change an answer.
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir, make_temp_dir, read_text, write_text}
+import sysl.process.{Var, capture}
+import sysl.text.{Search, split}
+
+@setup
+isolate()
+    val empty = make_temp_dir("libgit2-noconfig").expect("a scratch directory")
+
+    set_search_path(Global, empty).expect("the global search path")
+    set_search_path(Xdg, empty).expect("the XDG search path")
+    set_search_path(System, empty).expect("the system search path")
+
+// -- Helpers --------------------------------------------------------------------------------------
+
+/** The signature every commit in these tests is made with, and the one `git` is given too. */
+private[libgit2] val ANN: Signature = Signature("Ann Author", "ann@example.com", 1700000000, 120)
+private[libgit2] val CAL: Signature = Signature("Cal Committer", "cal@example.com", 1700000100, -300)
+
+private[libgit2] scratch(name: string) -> string = make_temp_dir(s"libgit2-$name").expect("a scratch directory")
+
+/** `git -C dir args…`, with no configuration but its own and fixed identities and dates. */
+private[libgit2] git_run(dir: string, args: []const string) -> (bool, string)
+    val all: Buf[string] = buf()
+
+    all.push("-C")
+    all.push(dir)
+    all.extend(args)
+
+    val env: [10]Var = [Var("GIT_CONFIG_GLOBAL", "/dev/null"), Var("GIT_CONFIG_NOSYSTEM", "1"),
+                        Var("GIT_AUTHOR_NAME", ANN.name), Var("GIT_AUTHOR_EMAIL", ANN.email),
+                        Var("GIT_AUTHOR_DATE", "1700000000 +0200"),
+                        Var("GIT_COMMITTER_NAME", CAL.name), Var("GIT_COMMITTER_EMAIL", CAL.email),
+                        Var("GIT_COMMITTER_DATE", "1700000100 -0500"), Var("LC_ALL", "C"),
+                        Var("GIT_PAGER", "cat")]
+    val out = capture("git", all.view(), env = env[..]).expect("git runs")
+
+    (out.status.ok(), out.text)
+
+/** `git`'s standard output, where it must succeed. */
+private[libgit2] git(dir: string, args: []const string) -> string
+    val (ok, text) = git_run(dir, args)
+
+    assert(ok, s"git ${args[0]} failed")
+    text
+
+/** `git`'s first line of output. */
+private[libgit2] git1(dir: string, args: []const string) -> string = git(dir, args).trim_end()
+
+private[libgit2] put_file(dir: string, name: string, text: string) =
+    write_text(s"$dir/$name", text).expect(s"wrote $name")
+
+/** Stage `files` and commit them through the binding onto `HEAD`. */
+private[libgit2] commit_files(repo: &Repository, files: []const (string, string),
+                              message: string) -> Oid
+    val index = repo.index().expect("the index")
+
+    for (name, text) in files
+        put_file(repo.workdir().unwrap(), name, text)
+        index.add(name).expect(s"staged $name")
+
+    index.write().expect("index written")
+
+    val tree = repo.find_tree(index.write_tree().expect("a tree")).expect("the tree")
+    val parents: Buf[&Commit] = buf()
+
+    repo.head().ok().map((h) -> h.target().unwrap()) match
+        Some(id) -> parents.push(repo.find_commit(id).expect("the parent"))
+        None -> ()
+
+    repo.commit(Some("HEAD"), ANN, CAL, message, tree, parents.view()).expect("committed")
+
+/** A repository made by the binding, `HEAD` on `main`. */
+private[libgit2] fresh(name: string) -> &Repository
+    val repo = init(scratch(name)).expect("a new repository")
+
+    repo.set_head("refs/heads/main").expect("HEAD on main")
+    repo
+
+// -- Repositories ---------------------------------------------------------------------------------
+
+@test("a repository the binding makes is one git reads, and an empty one has an unborn HEAD")
+init_is_read_by_git()
+    val repo = init(scratch("init")).expect("a new repository")
+    val dir = repo.workdir().unwrap()
+
+    assert(dir.ends_with("/"))
+    assert_eq(repo.path(), s"$dir.git/")
+    assert(!repo.is_bare())
+    assert_eq(git1(dir, ["symbolic-ref", "HEAD"]), "refs/heads/master")
+    assert_eq(repo.is_empty(), Ok(true))
+    assert_eq(repo.head_unborn(), Ok(true))
+
+    // libgit2's "empty" means HEAD on the *default* branch with no commits, so pointing HEAD at
+    // another unborn branch leaves it unborn but no longer empty.
+    repo.set_head("refs/heads/main").expect("HEAD on main")
+    assert_eq(repo.is_empty(), Ok(false))
+    assert_eq(repo.head_unborn(), Ok(true))
+    assert_eq(repo.state(), Clean)
+    assert_eq(git1(dir, ["rev-parse", "--git-dir"]), ".git")
+    assert_eq(git1(dir, ["symbolic-ref", "HEAD"]), "refs/heads/main")
+
+@test("a bare repository has no working tree, as git says")
+init_bare()
+    val dir = scratch("bare")
+    val repo = init(dir, bare = true).expect("a bare repository")
+
+    assert(repo.is_bare())
+    assert_eq(repo.workdir(), None)
+    assert_eq(git1(dir, ["rev-parse", "--is-bare-repository"]), "true")
+
+@test("discover finds the .git directory from a subdirectory, as git rev-parse does")
+discover_from_subdirectory()
+    val repo = fresh("discover")
+    val dir = repo.workdir().unwrap()
+
+    make_dir(s"${dir}sub").expect("a subdirectory")
+    assert_eq(discover(s"${dir}sub").expect("found"), repo.path())
+
+// -- Commits, trees and blobs ---------------------------------------------------------------------
+
+@test("a commit made by the binding is the commit git cat-file prints, byte for byte")
+commit_read_by_git()
+    val repo = fresh("commit")
+    val dir = repo.workdir().unwrap()
+    val id = commit_files(repo, [("a.txt", "alpha\n"), ("b.txt", "beta\n")], "First\n\nThe body.\n")
+    val tree = git1(dir, ["rev-parse", "HEAD^{tree}"])
+
+    assert_eq(git1(dir, ["rev-parse", "HEAD"]), id.hex())
+    assert_eq(git(dir, ["cat-file", "-p", id.hex()]),
+              s"tree $tree\nauthor Ann Author <ann@example.com> 1700000000 +0200\n" +
+              "committer Cal Committer <cal@example.com> 1700000100 -0500\n\nFirst\n\nThe body.\n")
+    assert_eq(git(dir, ["ls-tree", "HEAD"]),
+              s"100644 blob ${git1(dir, ["rev-parse", "HEAD:a.txt"])}\ta.txt\n" +
+              s"100644 blob ${git1(dir, ["rev-parse", "HEAD:b.txt"])}\tb.txt\n")
+    assert_eq(git(dir, ["show", "HEAD:b.txt"]), "beta\n")
+
+@test("a second commit's parent is the first, and git log lists both in the binding's order")
+second_commit_has_parent()
+    val repo = fresh("parent")
+    val dir = repo.workdir().unwrap()
+    val first = commit_files(repo, [("a.txt", "one\n")], "one")
+    val second = commit_files(repo, [("a.txt", "two\n")], "two")
+    val c2 = repo.find_commit(second).expect("the commit")
+
+    assert_eq(c2.parent_ids().view(), [first][..])
+    assert_eq(git1(dir, ["rev-parse", "HEAD~1"]), first.hex())
+    assert_eq(git1(dir, ["log", "--format=%s"]), "two\none")
+
+@test("a repository git made is read by the binding: head, commit, signature, tree and blob")
+reads_what_git_made()
+    val dir = scratch("gitmade")
+
+    git(dir, ["init", "-q", "-b", "trunk"])
+    put_file(dir, "readme.md", "# hi\n")
+    make_dir(s"$dir/src").expect("src")
+    put_file(dir, "src/main.c", "int main(void) { return 0; }\n")
+    git(dir, ["add", "-A"])
+    git(dir, ["commit", "-q", "-m", "Initial import"])
+
+    val repo = open(dir).expect("opened")
+    val head = repo.head().expect("HEAD")
+
+    assert_eq(head.name(), "refs/heads/trunk")
+    assert_eq(head.shorthand(), "trunk")
+
+    val commit = repo.find_commit(head.target().unwrap()).expect("the commit")
+
+    assert_eq(commit.id().hex(), git1(dir, ["rev-parse", "HEAD"]))
+    assert_eq(commit.summary(), "Initial import")
+    assert_eq(commit.message(), "Initial import\n")
+    assert_eq(commit.author(), ANN)
+    assert_eq(commit.committer(), CAL)
+    assert_eq(commit.parent_ids().len(), 0)
+
+    val tree = commit.tree().expect("the tree")
+    val listed = git(dir, ["ls-tree", "HEAD"])
+    var mine = ""
+
+    for e in tree.entries()
+        val kind = if e.kind() == TreeKind then "tree" else "blob"
+        val mode = if e.mode() == Dir then "040000" else "100644"
+
+        mine += s"$mode $kind ${e.id()}\t${e.name()}\n"
+
+    assert_eq(mine, listed)
+    assert_eq(tree.len(), 2)
+
+    val src = tree.entry_named("src").expect("src")
+
+    assert_eq(src.mode(), Dir)
+
+    val main_c = repo.revparse("HEAD:src/main.c").expect("the blob").id()
+    val blob = repo.find_blob(main_c).expect("the blob")
+
+    assert_eq(blob.text(), "int main(void) { return 0; }\n")
+    assert_eq(blob.len(), 29)
+    assert(!blob.is_binary())
+    assert_eq(main_c.hex(), git1(dir, ["rev-parse", "HEAD:src/main.c"]))
+
+@test("a blob's borrowed bytes are its content, and a NUL makes it binary")
+blob_bytes()
+    val repo = fresh("blob")
+    var data: [5]u8 = [104, 0, 105, 10, 255]
+    val id = repo.write_blob(data[..]).expect("written")
+    val blob = repo.find_blob(id).expect("the blob")
+    val content = blob.content()
+
+    assert_eq(content.bytes, data[..])
+    assert(blob.is_binary())
+    assert_eq(git1(repo.workdir().unwrap(), ["cat-file", "-s", id.hex()]), "5")
+
+@test("a blob's id is git hash-object's")
+blob_id_is_git_hash()
+    val repo = fresh("hash")
+    val dir = repo.workdir().unwrap()
+
+    put_file(dir, "h.txt", "hello\n")
+
+    val id = repo.write_blob("hello\n".bytes).expect("written")
+
+    assert_eq(id.hex(), git1(dir, ["hash-object", "h.txt"]))
+    assert_eq(id.hex(), "ce013625030ba8dba906f756967f9e9ca394464a")
+
+@test("a tree built entry by entry is the tree git ls-tree reads back")
+tree_builder_writes()
+    val repo = fresh("builder")
+    val dir = repo.workdir().unwrap()
+    val a = repo.write_blob("a\n".bytes).expect("a")
+    val b = repo.write_blob("#!/bin/sh\n".bytes).expect("b")
+    val builder = repo.tree_builder().expect("a builder")
+
+    builder.insert("z.txt", a).expect("z")
+    builder.insert("run.sh", b, Executable).expect("run")
+    builder.insert("gone", a).expect("gone")
+    builder.remove("gone").expect("removed")
+    assert_eq(builder.len(), 2)
+
+    val tree = builder.write().expect("written")
+
+    assert_eq(git(dir, ["ls-tree", tree.hex()]),
+              s"100755 blob ${b.hex()}\trun.sh\n100644 blob ${a.hex()}\tz.txt\n")
+
+@test("an object id round-trips through its hex, and a short or bad one is refused")
+oid_round_trip()
+    val id = oid("ce013625030ba8dba906f756967f9e9ca394464a").expect("parsed")
+
+    assert_eq(id.hex(), "ce013625030ba8dba906f756967f9e9ca394464a")
+    assert_eq(id.short(), "ce01362")
+    assert(!id.is_zero())
+    assert_eq(str(id), "ce013625030ba8dba906f756967f9e9ca394464a")
+
+    val short = oid("ce01362").unwrap_err()
+
+    assert_eq(short.code, InvalidSpec)
+    assert_eq(short.message, "an object id is 40 hex digits, not 7")
+
+    val bad = oid("zz013625030ba8dba906f756967f9e9ca394464a").unwrap_err()
+
+    assert_eq(bad.code, Generic)
+    assert_eq(bad.class, Invalid)
+    assert_eq(bad.message, "unable to parse OID - contains invalid characters")
+
+@test("every object a repository handed out keeps it open after the last name for it goes")
+objects_keep_repository_alive()
+    val dir = scratch("alive")
+
+    git(dir, ["init", "-q", "-b", "main"])
+    put_file(dir, "f", "x\n")
+    git(dir, ["add", "f"])
+    git(dir, ["commit", "-q", "-m", "only"])
+
+    val commit = open(dir).expect("opened").revparse("HEAD").expect("HEAD").as_commit().expect("a commit")
+    val tree = commit.tree().expect("its tree")
+    val entry = tree.entry(0).expect("an entry")
+
+    assert_eq(commit.summary(), "only")
+    assert_eq(entry.name(), "f")
+    assert_eq(repo_of(commit).find_blob(entry.id()).expect("the blob").text(), "x\n")
+
+private repo_of(c: &Commit) -> &Repository = c.repo
+
+// -- History --------------------------------------------------------------------------------------
+
+@test("a revwalk visits what git log lists, in its order, and stops where git log A.. does")
+revwalk_matches_git_log()
+    val repo = fresh("walk")
+    val dir = repo.workdir().unwrap()
+    val ids: Buf[Oid] = buf()
+
+    for i in 0..<5 do ids.push(commit_files(repo, [("n", s"$i\n")], s"commit $i"))
+
+    val walk = repo.revwalk().expect("a walk")
+
+    walk.push_head().expect("from HEAD")
+    walk.sort(TopologicalByTime).expect("sorted")
+
+    var listed = ""
+
+    for id in walk.ids().expect("walked") do listed += s"$id\n"
+    assert_eq(listed, git(dir, ["log", "--format=%H"]))
+
+    val since = repo.revwalk().expect("a walk")
+
+    since.push_head().expect("from HEAD")
+    since.hide(ids.at(1)).expect("hidden")
+    since.sort(Topological, reverse = true).expect("sorted")
+
+    var later = ""
+
+    for id in since.ids().expect("walked") do later += s"$id\n"
+    assert_eq(later, git(dir, ["log", "--reverse", "--format=%H", s"${ids.at(1)}.."]))
+
+@test("a revwalk is a cursor a for loop can walk")
+revwalk_iterates()
+    val repo = fresh("cursor")
+    val first = commit_files(repo, [("n", "1\n")], "one")
+    val second = commit_files(repo, [("n", "2\n")], "two")
+    var walk = repo.revwalk().expect("a walk")
+
+    walk.push_head().expect("from HEAD")
+
+    val seen: Buf[Oid] = buf()
+
+    for id in walk do seen.push(id)
+    assert_eq(seen.view(), [second, first][..])
+
+// -- References, branches and tags ----------------------------------------------------------------
+
+@test("branches made, listed and deleted by the binding are the ones git branch lists")
+branches_match_git()
+    val repo = fresh("branches")
+    val dir = repo.workdir().unwrap()
+    val tip = repo.find_commit(commit_files(repo, [("f", "1\n")], "one")).expect("the tip")
+
+    repo.create_branch("feature", tip).expect("feature")
+    repo.create_branch("fix", tip).expect("fix")
+
+    var names = ""
+
+    for b in repo.branches().expect("listed") do names += b.branch_name().expect("a name") + "\n"
+    assert_eq(names, git(dir, ["branch", "--list", "--format=%(refname:short)"]))
+    assert(repo.find_branch("main").expect("main").is_head())
+    assert(!repo.find_branch("fix").expect("fix").is_head())
+
+    val dup = repo.create_branch("fix", tip).unwrap_err()
+
+    assert_eq(dup.code, Exists)
+    assert_eq(dup.message, "failed to write reference 'refs/heads/fix': a reference with that name already exists.")
+
+    repo.find_branch("fix").expect("fix").delete_branch().expect("deleted")
+    assert_eq(git(dir, ["branch", "--list", "--format=%(refname:short)"]), "feature\nmain\n")
+
+@test("references: direct, symbolic, resolved and listed as git show-ref has them")
+references_match_git()
+    val repo = fresh("refs")
+    val dir = repo.workdir().unwrap()
+    val tip = commit_files(repo, [("f", "1\n")], "one")
+
+    repo.create_reference("refs/notes/mine", tip, log_message = "made").expect("direct")
+    repo.create_symbolic_reference("refs/alias", "refs/heads/main").expect("symbolic")
+
+    val alias = repo.find_reference("refs/alias").expect("found")
+
+    assert(alias.is_symbolic())
+    assert_eq(alias.symbolic_target(), Some("refs/heads/main"))
+    assert_eq(alias.target(), None)
+    assert_eq(alias.resolve().expect("resolved").target(), Some(tip))
+    assert_eq(repo.reference_id("refs/alias").expect("its id"), tip)
+    assert_eq(git1(dir, ["rev-parse", "refs/notes/mine"]), tip.hex())
+    assert_eq(git1(dir, ["symbolic-ref", "refs/alias"]), "refs/heads/main")
+
+    var mine = ""
+
+    for name in repo.references().expect("listed") do if name.starts_with("refs/heads") || name.starts_with("refs/notes") then mine += name + "\n"
+    assert_eq(mine, git(dir, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/notes"]))
+
+    repo.find_reference("refs/notes/mine").expect("found").delete().expect("deleted")
+    assert(!git_run(dir, ["rev-parse", "--verify", "-q", "refs/notes/mine"]).0)
+
+@test("an annotated tag is a tag object git reads; a lightweight one is only a reference")
+tags_match_git()
+    val repo = fresh("tags")
+    val dir = repo.workdir().unwrap()
+    val tip = repo.find_commit(commit_files(repo, [("f", "1\n")], "one")).expect("the tip")
+    val tag_id = repo.create_tag("v1.0", tip, ANN, "Release one\n").expect("tagged")
+    val light = repo.create_lightweight_tag("light", tip).expect("tagged")
+
+    assert_eq(light, tip.id())
+    assert_eq(git1(dir, ["cat-file", "-t", "v1.0"]), "tag")
+    assert_eq(git1(dir, ["cat-file", "-t", "light"]), "commit")
+    assert_eq(git(dir, ["cat-file", "-p", tag_id.hex()]),
+              s"object ${tip.id()}\ntype commit\ntag v1.0\n" +
+              "tagger Ann Author <ann@example.com> 1700000000 +0200\n\nRelease one\n")
+
+    val tag = repo.find_tag(tag_id).expect("the tag")
+
+    assert_eq(tag.name(), "v1.0")
+    assert_eq(tag.message(), "Release one\n")
+    assert_eq(tag.target_id(), tip.id())
+    assert_eq(tag.tagger(), Some(ANN))
+    assert_eq(repo.revparse("v1.0^{}").expect("peeled").id(), tip.id())
+
+    var names = ""
+
+    for n in repo.tag_names().expect("listed") do names += n + "\n"
+    assert_eq(names, git(dir, ["tag", "-l"]))
+
+    val seen: Buf[string] = buf()
+
+    repo.tag_foreach((name, id) ->
+        seen.push(s"$name $id")
+        true).expect("visited")
+    assert_eq(seen.len(), 2)
+    assert_eq(seen.at(0), s"refs/tags/light ${tip.id()}")
+
+    repo.delete_tag("light").expect("deleted")
+    assert_eq(git(dir, ["tag", "-l"]), "v1.0\n")
+
+// -- Errors ---------------------------------------------------------------------------------------
+
+@test("opening a directory that is not a repository is NotFound, with libgit2's message")
+open_non_repository()
+    val dir = scratch("notrepo")
+    val e = open(dir).unwrap_err()
+
+    assert_eq(e.code, NotFound)
+    assert_eq(e.class, Repository)
+    assert_eq(e.message, s"could not find repository at '$dir'")
+
+@test("an unknown reference is NotFound in the Reference class")
+unknown_reference()
+    val repo = fresh("unknownref")
+
+    commit_files(repo, [("f", "1\n")], "one")
+
+    val e = repo.find_reference("refs/heads/nope").unwrap_err()
+
+    assert_eq(e.code, NotFound)
+    assert_eq(e.class, Reference)
+    assert_eq(e.message, "reference 'refs/heads/nope' not found")
+
+    val r = repo.revparse("nope").unwrap_err()
+
+    assert_eq(r.code, NotFound)
+    assert_eq(r.message, "revspec 'nope' not found")
+
+@test("HEAD on a branch with no commits is UnbornBranch, and a walk from it fails naming the branch")
+unborn_head()
+    val repo = fresh("unborn")
+    val e = repo.head().unwrap_err()
+
+    assert_eq(e.code, UnbornBranch)
+    assert_eq(e.class, Reference)
+    assert_eq(e.message, "reference 'refs/heads/main' not found")
+
+    val w = repo.revwalk().expect("a walk").push_head().unwrap_err()
+
+    // A walk asks for HEAD's commit, and libgit2 reports the missing reference as a plain failure.
+    assert_eq(w.code, Generic)
+    assert_eq(w.message, "reference 'refs/heads/main' not found")
+
+@test("a checkout that would overwrite a change is Conflict, and moves nothing")
+conflicting_checkout()
+    val repo = fresh("conflict")
+    val dir = repo.workdir().unwrap()
+    val base = repo.find_commit(commit_files(repo, [("f.txt", "base\n")], "base")).expect("base")
+
+    repo.create_branch("other", base).expect("other")
+    commit_files(repo, [("f.txt", "main\n")], "on main")
+    put_file(dir, "f.txt", "edited, not committed\n")
+
+    val e = repo.checkout_branch("other").unwrap_err()
+
+    assert_eq(e.code, Conflict)
+    assert_eq(e.class, Checkout)
+    assert_eq(e.message, "1 conflict prevents checkout")
+    assert_eq(git1(dir, ["symbolic-ref", "HEAD"]), "refs/heads/main")
+    assert_eq(read_text(s"${dir}f.txt").expect("read"), "edited, not committed\n")
+
+@test("every error class libgit2 numbers has a name here, in the header's order")
+error_classes_cover_the_header()
+    assert_eq(class_of(c.ERROR_NONE), None)
+    assert_eq(class_of(c.ERROR_REFERENCE), Reference)
+    assert_eq(class_of(c.ERROR_REPOSITORY), Repository)
+    assert_eq(class_of(c.ERROR_CHECKOUT), Checkout)
+    assert_eq(class_of(c.ERROR_CALLBACK), Callback)
+    assert_eq(class_of(c.ERROR_GRAFTS), Grafts)
+    assert_eq(class_of(c.ERROR_GRAFTS + 1), Unknown(c.ERROR_GRAFTS + 1))
+    assert_eq(code_of(c.ECONFLICT), Conflict)
+    assert_eq(code_of(-99), Other(-99))
+
+// -- Checkout and state ---------------------------------------------------------------------------
+
+@test("checking out a branch writes its tree, moves HEAD, and reports every file it wrote")
+checkout_branch_matches_git()
+    val repo = fresh("checkout")
+    val dir = repo.workdir().unwrap()
+    val base = repo.find_commit(commit_files(repo, [("f.txt", "base\n")], "base")).expect("base")
+
+    repo.create_branch("other", base).expect("other")
+    commit_files(repo, [("f.txt", "main\n"), ("g.txt", "only on main\n")], "on main")
+
+    val steps: Buf[CheckoutProgress] = buf()
+
+    repo.checkout_branch("other", on_progress = Some((p) -> steps.push(p))).expect("checked out")
+    assert_eq(git1(dir, ["symbolic-ref", "HEAD"]), "refs/heads/other")
+    assert_eq(read_text(s"${dir}f.txt").expect("read"), "base\n")
+    assert_eq(git(dir, ["status", "--porcelain"]), "")
+    assert(steps.len() > 0)
+
+    val last = steps.at(steps.len() - 1)
+
+    assert_eq(last.completed, last.total)
+    assert_eq(last.total, 2)
+
+@test("a forced checkout of HEAD throws away a change in the working tree")
+forced_checkout_head()
+    val repo = fresh("force")
+    val dir = repo.workdir().unwrap()
+
+    commit_files(repo, [("f.txt", "kept\n")], "one")
+    put_file(dir, "f.txt", "scribble\n")
+    repo.checkout_head(force = true).expect("checked out")
+    assert_eq(read_text(s"${dir}f.txt").expect("read"), "kept\n")
+    assert_eq(git(dir, ["status", "--porcelain"]), "")
+
+@test("a merge in progress is the Merge state until cleaned up")
+merge_state()
+    val repo = fresh("state")
+    val dir = repo.workdir().unwrap()
+    val base = repo.find_commit(commit_files(repo, [("f", "base\n")], "base")).expect("base")
+
+    repo.create_branch("side", base).expect("side")
+    commit_files(repo, [("f", "main\n")], "main")
+    git(dir, ["checkout", "-q", "side"])
+    put_file(dir, "f", "side\n")
+    git(dir, ["commit", "-q", "-am", "side"])
+    git(dir, ["checkout", "-q", "main"])
+
+    val (merged, _) = git_run(dir, ["merge", "-q", "side"])
+
+    assert(!merged)
+    assert_eq(repo.state(), Merge)
+    val index = repo.index().expect("the index")
+
+    // The repository keeps the index it loaded for `commit_files`; git has since rewritten the file.
+    assert(!index.has_conflicts())
+    index.read().expect("reread")
+    assert(index.has_conflicts())
+    assert_eq(repo.status_file("f").expect("its status").porcelain(), "UU")
+    repo.cleanup_state().expect("cleaned")
+    assert_eq(repo.state(), Clean)
+    assert(!git_run(dir, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).0)

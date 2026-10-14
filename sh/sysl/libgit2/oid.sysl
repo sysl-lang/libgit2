@@ -1,0 +1,49 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.text.{cstring, from_utf8}
+
+/** A git object id: the twenty bytes of an object's SHA-1. It is an ordinary value — copying one is
+ * copying twenty bytes, and nothing about it belongs to a repository. */
+struct Oid
+    private[libgit2] raw: c.Oid
+
+    /** The forty lowercase hex digits git prints. */
+    hex(self) -> string
+        var digits: [40]u8 = [0; 40]
+        var id = self.raw
+
+        c.oid_fmt(&digits[0], &id)
+        from_utf8(digits[..]).unwrap()
+
+    /** The first `n` hex digits, as `git log --abbrev=n` prints them. */
+    short(self, n: usize = 7) -> string = self.hex()[0..<(if n < 40 then n else 40)]
+
+    /** Whether every byte is zero: the id libgit2 answers where there is no object. */
+    is_zero(self) -> bool
+        for b in self.raw.id do if b != 0 then return false
+        true
+
+    /** The twenty raw bytes. */
+    bytes(self) -> [20]u8 = self.raw.id
+
+impl Display for Oid
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.hex(), out, fmt)
+
+impl Eq for Oid
+    eq(self, rhs: Oid) -> bool = self.raw.id == rhs.raw.id
+
+/** The id written as forty hex digits. Anything else — a prefix, a non-hex character, a longer
+ * string — is libgit2's refusal, or `InvalidSpec` for a prefix, which names an object only through
+ * [Repository.revparse]. */
+oid(hex: string) -> Result[Oid, Error]
+    if hex.len != 40 then
+        return Err(Error(InvalidSpec, Invalid, s"an object id is 40 hex digits, not ${hex.len}"))
+
+    var id = c.Oid([0; 20])
+
+    check(c.oid_fromstrn(&id, cstring(hex).ptr, hex.len))?
+    Ok(Oid(id))
+
+/** The id C answered through a pointer, copied. */
+private[libgit2] oid_at(p: *c.Oid) -> Oid = Oid(*p)

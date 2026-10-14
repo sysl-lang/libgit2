@@ -1,0 +1,85 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+
+/** The order a walk visits commits in. */
+enum Order derives Display
+    /** libgit2's default: reverse chronological by the order commits are reached. */
+    Unsorted
+    /** Parents never before their children (`git log --topo-order`). */
+    Topological
+    /** By commit time, newest first (`git log --date-order`, roughly). */
+    ByTime
+    /** Topological, ties broken by time — what `git log` prints for a linear or merged history. */
+    TopologicalByTime
+
+/** A walk over history (`git log`): push the commits to start from, hide the ones to stop at, then
+ * take ids from it as an `Iterate` cursor or all at once with [ids]. */
+struct Revwalk
+    private raw: *c.Revwalk
+    private repo: &Repository
+
+    /** Start from `id`. */
+    push(self, id: Oid) -> Result[unit, Error]
+        var raw = id.raw
+
+        check(c.revwalk_push(self.raw, &raw))
+
+    /** Start from `HEAD`. An unborn `HEAD` is a `Generic` failure naming the missing branch
+     * (`reference 'refs/heads/main' not found`); [Repository.head] is the call that says `UnbornBranch`. */
+    push_head(self) -> Result[unit, Error] = check(c.revwalk_push_head(self.raw))
+
+    /** Start from the commit `refname` resolves to. */
+    push_ref(self, refname: string) -> Result[unit, Error] =
+        check(c.revwalk_push_ref(self.raw, cstring(refname).ptr))
+
+    /** Stop at `id`: neither it nor its ancestors are visited (`git log id..`). */
+    hide(self, id: Oid) -> Result[unit, Error]
+        var raw = id.raw
+
+        check(c.revwalk_hide(self.raw, &raw))
+
+    /** Visit in `order`, oldest first where `reverse`. */
+    sort(self, order: Order, reverse: bool = false) -> Result[unit, Error]
+        val mode = order match
+            Unsorted -> c.SORT_NONE
+            Topological -> c.SORT_TOPOLOGICAL
+            ByTime -> c.SORT_TIME
+            TopologicalByTime -> c.SORT_TOPOLOGICAL | c.SORT_TIME
+
+        check(c.revwalk_sorting(self.raw, if reverse then mode | c.SORT_REVERSE else mode))
+
+    /** Every id the walk has left, or the first error libgit2 met. */
+    ids(self) -> Result[Buf[Oid], Error]
+        val out: Buf[Oid] = buf()
+
+        loop
+            var id = c.Oid([0; 20])
+            val rc = c.revwalk_next(&id, self.raw)
+
+            if rc == c.ITEROVER then return Ok(out)
+
+            check(rc)?
+            out.push(Oid(id))
+end Revwalk
+
+/** A walk is a cursor: `next` answers the next id, and `None` both at the end and where libgit2
+ * fails part-way — [Revwalk.ids] is the form that tells the two apart. */
+impl Iterate for Revwalk
+    type Item = Oid
+
+    next(*self) -> Option[Oid]
+        var id = c.Oid([0; 20])
+
+        if c.revwalk_next(&id, self.raw) == 0 then Some(Oid(id)) else None
+
+impl Drop for Revwalk
+    drop(self) = c.revwalk_free(self.raw)
+
+private[libgit2] revwalk(repo: &Repository) -> Result[&Revwalk, Error]
+    var out: *c.Revwalk = null
+
+    check(c.revwalk_new(&out, repo.raw))?
+    Ok(Revwalk(out, repo))

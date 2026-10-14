@@ -1,0 +1,477 @@
+module sh.sysl.libgit2
+@tests
+
+// Diffs, status, blame, the stash, configuration, cloning and credentials, each against `git`.
+// The helpers (`fresh`, `commit_files`, `git`, the fixed signatures) are in `tests.sysl`.
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir, read_text, remove_file, write_text}
+import sysl.text.{Search, split}
+
+/** Two commits: `a.txt` changed, `c.txt` deleted, `d.txt` added, `b.txt` untouched. */
+private two_commits(name: string) -> (&Repository, Oid, Oid)
+    val repo = fresh(name)
+    val first = commit_files(repo, [("a.txt", "1\n2\n3\n"), ("b.txt", "keep\n"), ("c.txt", "gone\n")],
+                             "first")
+
+    remove_file(s"${repo.workdir().unwrap()}c.txt").expect("removed")
+
+    val index = repo.index().expect("the index")
+
+    index.remove("c.txt").expect("unstaged")
+    index.write().expect("written")
+
+    val second = commit_files(repo, [("a.txt", "1\nTWO\n3\n"), ("d.txt", "new file\n")], "second")
+
+    (repo, first, second)
+
+private tree_of(repo: &Repository, id: Oid) -> &Tree =
+    repo.find_commit(id).expect("the commit").tree().expect("its tree")
+
+// -- Diffs ----------------------------------------------------------------------------------------
+
+@test("a tree-to-tree diff's patch is git diff's, byte for byte, and its deltas say what changed")
+diff_trees_matches_git()
+    val (repo, first, second) = two_commits("difftrees")
+    val dir = repo.workdir().unwrap()
+    val diff = repo.diff_trees(Some(tree_of(repo, first)), Some(tree_of(repo, second))).expect("a diff")
+
+    assert_eq(diff.patch().expect("the patch"), git(dir, ["diff", first.hex(), second.hex()]))
+    assert_eq(diff.len(), 3)
+
+    val deltas = diff.deltas()
+
+    assert_eq(deltas.at(0).status, Modified)
+    assert_eq(deltas.at(0).new_file.path, "a.txt")
+    assert_eq(deltas.at(0).new_file.id.hex(), git1(dir, ["rev-parse", "HEAD:a.txt"]))
+    assert_eq(deltas.at(1).status, Deleted)
+    assert_eq(deltas.at(1).old_file.path, "c.txt")
+    assert(deltas.at(1).new_file.id.is_zero())
+    assert_eq(deltas.at(2).status, Added)
+    assert_eq(deltas.at(2).new_file.mode, File)
+    assert_eq(diff.patch_of(0).expect("a.txt's patch"),
+              git(dir, ["diff", first.hex(), second.hex(), "--", "a.txt"]))
+
+@test("a diff from nothing is every file added, as git diff against the empty tree prints it")
+diff_from_empty_tree()
+    val (repo, first, _) = two_commits("diffempty")
+    val dir = repo.workdir().unwrap()
+    val empty = git1(dir, ["hash-object", "-t", "tree", "/dev/null"])
+    val diff = repo.diff_trees(None, Some(tree_of(repo, first))).expect("a diff")
+
+    assert_eq(diff.patch().expect("the patch"), git(dir, ["diff", empty, first.hex()]))
+
+@test("the index-to-working-tree diff is git diff, and tree-to-index is git diff --cached")
+diff_workdir_and_index_match_git()
+    val (repo, _, second) = two_commits("diffwd")
+    val dir = repo.workdir().unwrap()
+
+    put_file(dir, "b.txt", "keep\nand more\n")
+    assert_eq(repo.diff_index_to_workdir().expect("a diff").patch().expect("the patch"),
+              git(dir, ["diff"]))
+
+    val index = repo.index().expect("the index")
+
+    index.add("b.txt").expect("staged")
+    index.write().expect("written")
+    put_file(dir, "a.txt", "changed again\n")
+    assert_eq(repo.diff_tree_to_index(Some(tree_of(repo, second))).expect("a diff").patch().expect("the patch"),
+              git(dir, ["diff", "--cached"]))
+    assert_eq(repo.diff_index_to_workdir().expect("a diff").patch().expect("the patch"),
+              git(dir, ["diff"]))
+
+@test("the context a patch carries is git diff -U's: the default three lines, one, and none")
+diff_context_lines()
+    val repo = fresh("diffcontext")
+    val dir = repo.workdir().unwrap()
+    val before = commit_files(repo, [("t.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n")], "ten")
+    val after = commit_files(repo, [("t.txt", "1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n")], "five")
+    val old = tree_of(repo, before)
+    val new = tree_of(repo, after)
+
+    assert_eq(repo.diff_trees(Some(old), Some(new)).expect("a diff").patch().expect("the patch"),
+              git(dir, ["diff", before.hex(), after.hex()]))
+    assert_eq(repo.diff_trees(Some(old), Some(new), context_lines = 1).expect("a diff").patch().expect("the patch"),
+              git(dir, ["diff", "-U1", before.hex(), after.hex()]))
+    assert_eq(repo.diff_trees(Some(old), Some(new), context_lines = 0).expect("a diff").patch().expect("the patch"),
+              git(dir, ["diff", "-U0", before.hex(), after.hex()]))
+
+@test("an untracked file is an addition only when asked for, as git diff --no-index shows it")
+diff_untracked()
+    val (repo, _, _) = two_commits("diffuntracked")
+    val dir = repo.workdir().unwrap()
+
+    put_file(dir, "u.txt", "untracked\n")
+    assert_eq(repo.diff_index_to_workdir().expect("a diff").len(), 0)
+
+    val diff = repo.diff_index_to_workdir(untracked = true).expect("a diff")
+
+    assert_eq(diff.len(), 1)
+    assert_eq(diff.delta(0).unwrap().status, Untracked)
+    assert_eq(diff.delta(0).unwrap().new_file.path, "u.txt")
+
+@test("foreach reports each file, hunk and line in patch order — the lines git diff prints")
+diff_foreach_matches_git()
+    val (repo, first, second) = two_commits("diffeach")
+    val dir = repo.workdir().unwrap()
+    val diff = repo.diff_trees(Some(tree_of(repo, first)), Some(tree_of(repo, second))).expect("a diff")
+    val events: Buf[DiffEvent] = buf()
+
+    diff.foreach((e) ->
+        events.push(e)
+        true).expect("walked")
+
+    var files = 0
+    var headers = ""
+    var body = ""
+
+    for e in events
+        e match
+            FileChanged(_) -> files += 1
+            HunkStarted(h) -> headers += h.header
+            LineOf(l) -> body += string(char(u32(l.origin))) + l.content
+
+    var want_headers = ""
+    var want_body = ""
+
+    for line in split(git(dir, ["diff", first.hex(), second.hex()]), "\n")
+        if line.starts_with("@@") then want_headers += line + "\n"
+        else if line.starts_with(" ") || (line.starts_with("+") && !line.starts_with("+++")) ||
+                (line.starts_with("-") && !line.starts_with("---")) then want_body += line + "\n"
+
+    assert_eq(files, 3)
+    assert_eq(headers, want_headers)
+    assert_eq(body, want_body)
+
+    events.at(0) match
+        FileChanged(d) -> assert_eq(d.new_file.path, "a.txt")
+        _ -> assert(false, "the first event is the first file")
+
+@test("foreach stops when the callback answers false, and a stop is not an error")
+diff_foreach_stops()
+    val (repo, first, second) = two_commits("diffstop")
+    val diff = repo.diff_trees(Some(tree_of(repo, first)), Some(tree_of(repo, second))).expect("a diff")
+    val seen: Buf[DiffEvent] = buf()
+
+    assert(diff.foreach((e) ->
+        seen.push(e)
+        false).is_ok())
+    assert_eq(seen.len(), 1)
+
+// -- Status ---------------------------------------------------------------------------------------
+
+private porcelain_of(entries: Buf[StatusEntry]) -> string
+    var out = ""
+
+    for e in entries do out += s"${e.status.porcelain()} ${e.path}\n"
+    out
+
+@test("status is git status --porcelain -uall, path for path and letter for letter")
+status_matches_git()
+    val repo = fresh("status")
+    val dir = repo.workdir().unwrap()
+
+    commit_files(repo, [("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")], "base")
+    put_file(dir, "a.txt", "a, changed\n")
+    remove_file(s"${dir}c.txt").expect("removed")
+    make_dir(s"${dir}u").expect("u")
+    put_file(dir, "u/x.txt", "untracked\n")
+    put_file(dir, "n.txt", "new\n")
+    put_file(dir, "b.txt", "b, staged\n")
+
+    val index = repo.index().expect("the index")
+
+    index.add("n.txt").expect("staged")
+    index.add("b.txt").expect("staged")
+    index.write().expect("written")
+    put_file(dir, "b.txt", "b, staged, then changed\n")
+
+    assert_eq(porcelain_of(repo.statuses().expect("statuses")), git(dir, ["status", "--porcelain", "-uall"]))
+    assert(repo.status_file("a.txt").expect("a's status").wt_modified())
+    assert(repo.status_file("n.txt").expect("n's status").index_new())
+    assert_eq(repo.status_file("b.txt").expect("b's status").porcelain(), "MM")
+
+    val e = repo.status_file("nowhere.txt").unwrap_err()
+
+    assert_eq(e.code, NotFound)
+    assert_eq(e.message, "attempt to get status of nonexistent file 'nowhere.txt'")
+
+@test("ignored files are listed only when asked for, as git status --ignored lists them")
+status_ignored()
+    val repo = fresh("ignored")
+    val dir = repo.workdir().unwrap()
+
+    commit_files(repo, [(".gitignore", "*.log\n")], "ignore logs")
+    put_file(dir, "build.log", "noise\n")
+    put_file(dir, "keep.txt", "keep\n")
+
+    assert_eq(porcelain_of(repo.statuses().expect("statuses")), "?? keep.txt\n")
+    // The same entries; git prints every untracked path before every ignored one, where libgit2
+    // keeps one order by path.
+    assert_eq(porcelain_of(repo.statuses(ignored = true).expect("statuses")),
+              "!! build.log\n?? keep.txt\n")
+    assert_eq(git(dir, ["status", "--porcelain", "-uall", "--ignored"]),
+              "?? keep.txt\n!! build.log\n")
+
+@test("status_foreach visits in git's order and stops when told")
+status_foreach_stops()
+    val repo = fresh("statuseach")
+    val dir = repo.workdir().unwrap()
+
+    commit_files(repo, [("a", "a\n")], "base")
+    put_file(dir, "x", "x\n")
+    put_file(dir, "y", "y\n")
+
+    val seen: Buf[string] = buf()
+
+    repo.status_foreach((p, s) ->
+        seen.push(p)
+        false).expect("visited")
+    assert_eq(seen.view(), ["x"][..])
+
+// -- Blame ----------------------------------------------------------------------------------------
+
+@test("blame's hunks are the groups git blame --porcelain prints: commit, start line and length")
+blame_matches_git()
+    val repo = fresh("blame")
+    val dir = repo.workdir().unwrap()
+    val first = commit_files(repo, [("f.txt", "a\nb\nc\n")], "first")
+    val second = commit_files(repo, [("f.txt", "a\nB\nc\nd\n")], "second")
+    var mine = ""
+
+    for h in repo.blame("f.txt").expect("blamed") do mine += s"${h.commit} ${h.start} ${h.lines}\n"
+
+    var theirs = ""
+
+    for line in split(git(dir, ["blame", "--porcelain", "f.txt"]), "\n")
+        val parts = split(line, " ")
+
+        if parts.len == 4 && parts[0].len == 40 then theirs += s"${parts[0]} ${parts[2]} ${parts[3]}\n"
+
+    assert_eq(mine, theirs)
+
+    val hunks = repo.blame("f.txt").expect("blamed")
+
+    assert_eq(hunks.at(0).commit, first)
+    assert_eq(hunks.at(1).commit, second)
+    assert_eq(hunks.at(0).author, Some(ANN))
+    assert_eq(hunks.at(0).orig_path, "f.txt")
+
+    val old = repo.blame("f.txt", newest = Some(first)).expect("blamed at the first commit")
+
+    assert_eq(old.len(), 1)
+    assert_eq(old.at(0).lines, 3)
+
+@test("blaming a path that is not in HEAD is NotFound")
+blame_missing_path()
+    val repo = fresh("blamemissing")
+
+    commit_files(repo, [("f.txt", "a\n")], "first")
+
+    val e = repo.blame("nope.txt").unwrap_err()
+
+    assert_eq(e.code, NotFound)
+    assert_eq(e.message, "the path 'nope.txt' does not exist in the given tree")
+
+// -- The stash ------------------------------------------------------------------------------------
+
+@test("a stash saved by the binding is the one git stash list shows, and pop brings it back")
+stash_matches_git()
+    val repo = fresh("stash")
+    val dir = repo.workdir().unwrap()
+
+    commit_files(repo, [("f.txt", "base\n")], "base")
+    put_file(dir, "f.txt", "dirty\n")
+
+    val id = repo.stash_save(ANN, "wip").expect("stashed")
+
+    assert_eq(git(dir, ["stash", "list"]), "stash@{0}: On main: wip\n")
+    assert_eq(git1(dir, ["rev-parse", "stash@{0}"]), id.hex())
+    assert_eq(read_text(s"${dir}f.txt").expect("read"), "base\n")
+    assert_eq(repo.stashes().expect("listed").view(), [StashEntry(0, "On main: wip", id)][..])
+
+    repo.stash_pop().expect("popped")
+    assert_eq(read_text(s"${dir}f.txt").expect("read"), "dirty\n")
+    assert_eq(git(dir, ["stash", "list"]), "")
+
+    put_file(dir, "u.txt", "untracked\n")
+    repo.stash_save(ANN, "with untracked", untracked = true).expect("stashed")
+    assert_eq(git(dir, ["status", "--porcelain", "-uall"]), "")
+    repo.stash_apply().expect("applied")
+    assert_eq(read_text(s"${dir}u.txt").expect("read"), "untracked\n")
+    repo.stash_drop().expect("dropped")
+    assert_eq(git(dir, ["stash", "list"]), "")
+
+@test("stashing a clean tree is NotFound, with libgit2's message")
+stash_nothing()
+    val repo = fresh("stashclean")
+
+    commit_files(repo, [("f.txt", "base\n")], "base")
+
+    val e = repo.stash_save(ANN, "nothing").unwrap_err()
+
+    assert_eq(e.code, NotFound)
+    assert_eq(e.class, Stash)
+    assert_eq(e.message, "cannot stash changes - there is nothing to stash.")
+
+// -- Configuration --------------------------------------------------------------------------------
+
+@test("configuration written by the binding is what git config reads, and the other way round")
+config_matches_git()
+    val repo = fresh("config")
+    val dir = repo.workdir().unwrap()
+    val cfg = repo.config().expect("the config")
+
+    cfg.set_string("sysl.name", "libgit2 binding").expect("set")
+    cfg.set_int("sysl.count", 42).expect("set")
+    cfg.set_bool("sysl.flag", true).expect("set")
+    assert_eq(git1(dir, ["config", "--local", "--get", "sysl.name"]), "libgit2 binding")
+    assert_eq(git1(dir, ["config", "--local", "--get", "sysl.count"]), "42")
+    assert_eq(git1(dir, ["config", "--local", "--get", "sysl.flag"]), "true")
+
+    git(dir, ["config", "sysl.other", "from git"])
+    git(dir, ["config", "sysl.size", "2k"])
+    git(dir, ["config", "sysl.yes", "on"])
+
+    val fresh_cfg = repo.config().expect("the config")
+
+    assert_eq(fresh_cfg.get_string("sysl.other"), Ok("from git"))
+    assert_eq(fresh_cfg.get_int("sysl.size"), Ok(2048))
+    assert_eq(fresh_cfg.get_bool("sysl.yes"), Ok(true))
+    assert_eq(fresh_cfg.get_string("sysl.name"), Ok("libgit2 binding"))
+
+    fresh_cfg.remove("sysl.name").expect("removed")
+    assert(!git_run(dir, ["config", "--local", "--get", "sysl.name"]).0)
+
+    val e = fresh_cfg.get_string("sysl.missing").unwrap_err()
+
+    assert_eq(e.code, NotFound)
+    assert_eq(e.class, Config)
+    assert_eq(e.message, "config value 'sysl.missing' was not found")
+
+@test("a configuration file opened alone is the file git config -f reads")
+config_file_matches_git()
+    val dir = scratch("configfile")
+    val file = s"$dir/settings"
+    val cfg = open_config(file).expect("opened")
+
+    cfg.set_string("core.editor", "ed").expect("set")
+    cfg.set_string("remote.origin.url", "file:///tmp/x").expect("set")
+    assert_eq(git1(dir, ["config", "-f", file, "--get", "remote.origin.url"]), "file:///tmp/x")
+    assert_eq(git1(dir, ["config", "-f", file, "--get", "core.editor"]), "ed")
+
+    val e = cfg.get_int("core.editor").unwrap_err()
+
+    assert_eq(e.class, Config)
+    assert_eq(e.message, "failed to parse 'ed' as an integer")
+
+// -- Cloning --------------------------------------------------------------------------------------
+
+/** A repository `git` made, with three commits on `main` and a branch `feature`. */
+private origin(name: string) -> string
+    val dir = scratch(name)
+
+    git(dir, ["init", "-q", "-b", "main"])
+
+    for i in 0..<3
+        put_file(dir, s"f$i.txt", s"file $i\n")
+        git(dir, ["add", "-A"])
+        git(dir, ["commit", "-q", "-m", s"commit $i"])
+
+    git(dir, ["branch", "feature", "HEAD~1"])
+    dir
+
+@test("a local clone is git's repository, commit for commit, and reports its checkout")
+clone_matches_git()
+    val src = origin("origin")
+    val dest = s"${scratch("clone")}/copy"
+    val steps: Buf[CheckoutProgress] = buf()
+    val url = s"file://$src"
+    val repo = clone(url, dest, on_checkout = Some((p) -> steps.push(p))).expect("cloned")
+
+    assert_eq(repo.head().expect("HEAD").shorthand(), "main")
+    assert_eq(git(dest, ["log", "--format=%H"]), git(src, ["log", "--format=%H"]))
+    assert_eq(git1(dest, ["remote", "get-url", "origin"]), url)
+    assert_eq(git1(dest, ["rev-parse", "origin/feature"]), git1(src, ["rev-parse", "feature"]))
+    assert_eq(git(dest, ["status", "--porcelain"]), "")
+    assert(steps.len() > 0)
+    assert_eq(steps.at(steps.len() - 1).completed, 3)
+    assert_eq(steps.at(steps.len() - 1).total, 3)
+
+@test("a clone may be bare, or check out another branch")
+clone_bare_and_branch()
+    val src = origin("origin2")
+    val bare_dir = s"${scratch("clonebare")}/bare.git"
+    val bare = clone(s"file://$src", bare_dir, bare = true).expect("cloned bare")
+
+    assert(bare.is_bare())
+    assert_eq(git1(bare_dir, ["rev-parse", "--is-bare-repository"]), "true")
+
+    val dest = s"${scratch("clonebranch")}/copy"
+    val repo = clone(s"file://$src", dest, branch = Some("feature")).expect("cloned")
+
+    assert_eq(repo.head().expect("HEAD").shorthand(), "feature")
+    assert_eq(git1(dest, ["rev-parse", "HEAD"]), git1(src, ["rev-parse", "feature"]))
+
+@test("cloning into a directory that is not empty is Exists; a missing source is an Os failure")
+clone_errors()
+    val src = origin("origin3")
+    val dest = scratch("cloneexists")
+
+    put_file(dest, "x", "here first\n")
+
+    val e = clone(s"file://$src", dest).unwrap_err()
+
+    assert_eq(e.code, Exists)
+    assert_eq(e.message, s"'$dest' exists and is not an empty directory")
+
+    val missing = clone(s"file://$src-nope", s"${scratch("clonemissing")}/copy").unwrap_err()
+
+    assert_eq(missing.code, Generic)
+    assert_eq(missing.class, Os)
+    assert_eq(missing.message, s"failed to resolve path '$src-nope': No such file or directory")
+
+// -- Credentials ----------------------------------------------------------------------------------
+//
+// A credential callback is only asked by a remote that wants one, over HTTPS or SSH; a local clone
+// never asks, and these tests have no network. So the trampoline libgit2 would call is called here
+// directly, with the payload a clone would have given it, and the credential it makes is read back.
+
+@test("the credential callback is asked what a remote asked, and its answer becomes a credential")
+credentials_answered()
+    val asked: Buf[CredentialRequest] = buf()
+    val watch: &RemoteWatch = RemoteWatch(None, Some((r) ->
+        asked.push(r)
+        if r.allows_password() then Some(Password("ann", "s3cret")) else None))
+    var out: *c.Credential = null
+    val rc = credentials_asked(&out, c"https://example.com/r.git", c"git",
+                               c.CREDENTIAL_USERPASS_PLAINTEXT | c.CREDENTIAL_SSH_KEY,
+                               ptr_cast(&*watch))
+
+    assert_eq(rc, 0)
+    assert(out != null)
+    assert_eq(text(c.credential_get_username(out)), "ann")
+    c.credential_free(out)
+    assert_eq(asked.len(), 1)
+    assert_eq(asked.at(0).url, "https://example.com/r.git")
+    assert_eq(asked.at(0).username, Some("git"))
+    assert(asked.at(0).allows_password())
+    assert(asked.at(0).allows_ssh_key())
+    assert(!asked.at(0).allows_default())
+
+    var none: *c.Credential = null
+
+    assert_eq(credentials_asked(&none, c"https://example.com/r.git", null, c.CREDENTIAL_SSH_KEY,
+                                ptr_cast(&*watch)), c.PASSTHROUGH)
+    assert(none == null)
+    assert_eq(asked.at(1).username, None)
+
+@test("with no credential callback a remote is passed through to libgit2's own refusal")
+credentials_absent()
+    val watch: &RemoteWatch = RemoteWatch(None, None)
+    var out: *c.Credential = null
+
+    assert_eq(credentials_asked(&out, c"https://example.com/r.git", null,
+                                c.CREDENTIAL_USERPASS_PLAINTEXT, ptr_cast(&*watch)), c.PASSTHROUGH)
+    assert(out == null)

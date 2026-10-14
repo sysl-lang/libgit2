@@ -1,0 +1,393 @@
+module sh.sysl.libgit2
+
+import sh.sysl.libgit2.c
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+
+/** What kind of object an id names: `git_object_t`. */
+enum Kind derives Display
+    CommitKind
+    TreeKind
+    BlobKind
+    TagKind
+    /** Any kind, where a lookup should not care. */
+    AnyKind
+    /** Not a kind libgit2 names. */
+    InvalidKind
+end Kind
+
+private[libgit2] kind_of(t: i32) -> Kind
+    if t == c.OBJECT_COMMIT then return CommitKind
+    if t == c.OBJECT_TREE then return TreeKind
+    if t == c.OBJECT_BLOB then return BlobKind
+    if t == c.OBJECT_TAG then return TagKind
+    if t == c.OBJECT_ANY then AnyKind else InvalidKind
+
+private[libgit2] kind_code(k: Kind) -> i32 = k match
+    CommitKind -> c.OBJECT_COMMIT
+    TreeKind -> c.OBJECT_TREE
+    BlobKind -> c.OBJECT_BLOB
+    TagKind -> c.OBJECT_TAG
+    AnyKind -> c.OBJECT_ANY
+    InvalidKind -> c.OBJECT_INVALID
+
+/** Who did something, and when: `git_signature`, copied out of libgit2. */
+struct Signature derives Eq, Display
+    name: string
+    email: string
+    /** Seconds since the Unix epoch. */
+    time: long
+    /** The author's offset from UTC, in minutes (`+0200` is 120). */
+    offset: int
+
+/** `name <email>` signed at this moment, in the local time zone. */
+signature_now(name: string, email: string) -> Result[Signature, Error]
+    var out: *c.Signature = null
+
+    check(c.signature_now(&out, cstring(name).ptr, cstring(email).ptr))?
+
+    val s = signature_of(out)
+
+    c.signature_free(out)
+    Ok(s)
+
+private[libgit2] signature_of(p: *c.Signature) -> Signature =
+    Signature(text(p.name), text(p.email), p.when.time, p.when.offset)
+
+/** A `git_signature` libgit2 allocated for one call, freed when the box goes. */
+private[libgit2] struct RawSignature
+    raw: *c.Signature
+
+impl Drop for RawSignature
+    drop(self) = c.signature_free(self.raw)
+
+private[libgit2] raw_signature(s: Signature) -> Result[&RawSignature, Error]
+    var out: *c.Signature = null
+
+    check(c.signature_new(&out, cstring(s.name).ptr, cstring(s.email).ptr, s.time, i32(s.offset)))?
+    Ok(RawSignature(out))
+
+/** Anything stored in the object database: what a checkout, a tag or a peel can take. */
+trait GitObject
+    object_ptr(self) -> *c.Object
+
+    /** The object's id. */
+    id(self) -> Oid = oid_at(c.object_id(self.object_ptr()))
+
+    /** What kind of object it is. */
+    kind(self) -> Kind = kind_of(c.object_type(self.object_ptr()))
+end GitObject
+
+/** An object whose kind was not known when it was looked up — what `revparse` answers. */
+struct Object
+    private[libgit2] raw: *c.Object
+    private[libgit2] repo: &Repository
+
+    /** This object peeled to `kind`: a tag to what it tags, a commit to its tree. */
+    peel(self, kind: Kind) -> Result[&Object, Error]
+        var out: *c.Object = null
+
+        check(c.object_peel(&out, self.raw, kind_code(kind)))?
+        Ok(Object(out, self.repo))
+
+    /** This object as a commit, peeling a tag on the way. */
+    as_commit(self) -> Result[&Commit, Error]
+        var out: *c.Object = null
+
+        check(c.object_peel(&out, self.raw, c.OBJECT_COMMIT))?
+        Ok(Commit(ptr_cast(out), self.repo))
+
+    /** This object as a tree, peeling a commit or a tag on the way. */
+    as_tree(self) -> Result[&Tree, Error]
+        var out: *c.Object = null
+
+        check(c.object_peel(&out, self.raw, c.OBJECT_TREE))?
+        Ok(Tree(ptr_cast(out), self.repo))
+end Object
+
+impl GitObject for Object
+    object_ptr(self) -> *c.Object = self.raw
+
+impl Drop for Object
+    drop(self) = c.object_free(self.raw)
+
+/** A commit. */
+struct Commit
+    private[libgit2] raw: *c.Commit
+    private[libgit2] repo: &Repository
+
+    /** The whole message, trailing newline included. */
+    message(self) -> string = text(c.commit_message(self.raw))
+
+    /** The first paragraph of the message, joined onto one line. */
+    summary(self) -> string = text(c.commit_summary(self.raw))
+
+    author(self) -> Signature = signature_of(c.commit_author(self.raw))
+
+    committer(self) -> Signature = signature_of(c.commit_committer(self.raw))
+
+    /** The id of the tree this commit records. */
+    tree_id(self) -> Oid = oid_at(c.commit_tree_id(self.raw))
+
+    /** The tree this commit records. */
+    tree(self) -> Result[&Tree, Error]
+        var out: *c.Tree = null
+
+        check(c.commit_tree(&out, self.raw))?
+        Ok(Tree(out, self.repo))
+
+    /** The ids of the parents, first parent first. */
+    parent_ids(self) -> Buf[Oid]
+        val out: Buf[Oid] = buf()
+
+        for i in 0..<c.commit_parentcount(self.raw) do out.push(oid_at(c.commit_parent_id(self.raw, i)))
+        out
+end Commit
+
+impl GitObject for Commit
+    object_ptr(self) -> *c.Object = ptr_cast(self.raw)
+
+impl Drop for Commit
+    drop(self) = c.commit_free(self.raw)
+
+/** A tree: one directory's names, each with an id and a mode. */
+struct Tree
+    private[libgit2] raw: *c.Tree
+    private[libgit2] repo: &Repository
+
+    /** How many entries. */
+    len(self) -> usize = c.tree_entrycount(self.raw)
+
+    /** The entry at `i`, in git's order (by name, byte-wise). */
+    entry(&self, i: usize) -> Option[TreeEntry]
+        val e = c.tree_entry_byindex(self.raw, i)
+
+        if e == null then None else Some(TreeEntry(e, self))
+
+    /** The entry called `name`, in this directory only. */
+    entry_named(&self, name: string) -> Option[TreeEntry]
+        val e = c.tree_entry_byname(self.raw, cstring(name).ptr)
+
+        if e == null then None else Some(TreeEntry(e, self))
+
+    /** Every entry, in git's order. */
+    entries(&self) -> Buf[TreeEntry]
+        val out: Buf[TreeEntry] = buf()
+
+        for i in 0..<c.tree_entrycount(self.raw) do
+            out.push(TreeEntry(c.tree_entry_byindex(self.raw, i), self))
+        out
+end Tree
+
+impl GitObject for Tree
+    object_ptr(self) -> *c.Object = ptr_cast(self.raw)
+
+impl Drop for Tree
+    drop(self) = c.tree_free(self.raw)
+
+/** A tree's mode for an entry: `git_filemode_t`. */
+enum Mode derives Eq, Display
+    /** `040000`, a directory. */
+    Dir
+    /** `100644`, an ordinary file. */
+    File
+    /** `100755`, an executable file. */
+    Executable
+    /** `120000`, a symbolic link. */
+    Link
+    /** `160000`, a submodule's commit. */
+    Submodule
+    /** Anything else, as the octal number. */
+    OtherMode(bits: int)
+end Mode
+
+private[libgit2] mode_of(m: i32) -> Mode
+    if m == c.FILEMODE_TREE then return Dir
+    if m == c.FILEMODE_BLOB then return File
+    if m == c.FILEMODE_BLOB_EXECUTABLE then return Executable
+    if m == c.FILEMODE_LINK then return Link
+    if m == c.FILEMODE_COMMIT then Submodule else OtherMode(m)
+
+private[libgit2] mode_code(m: Mode) -> i32 = m match
+    Dir -> c.FILEMODE_TREE
+    File -> c.FILEMODE_BLOB
+    Executable -> c.FILEMODE_BLOB_EXECUTABLE
+    Link -> c.FILEMODE_LINK
+    Submodule -> c.FILEMODE_COMMIT
+    OtherMode(bits) -> i32(bits)
+
+/** One entry of a tree: a **view** into the tree's own storage, which it keeps alive. */
+struct TreeEntry
+    private[libgit2] raw: *c.TreeEntry
+    private[libgit2] tree: &Tree
+
+    name(self) -> string = text(c.tree_entry_name(self.raw))
+    id(self) -> Oid = oid_at(c.tree_entry_id(self.raw))
+    kind(self) -> Kind = kind_of(c.tree_entry_type(self.raw))
+    mode(self) -> Mode = mode_of(c.tree_entry_filemode(self.raw))
+
+/** A blob: one file's content. */
+struct Blob
+    private[libgit2] raw: *c.Blob
+    private[libgit2] repo: &Repository
+
+    /** The size in bytes. */
+    len(self) -> usize = usize(c.blob_rawsize(self.raw))
+
+    /** Whether git would treat the content as binary (a NUL in the first 8000 bytes). */
+    is_binary(self) -> bool = c.blob_is_binary(self.raw) == 1
+
+    /** The content, as UTF-8 text (an invalid sequence becomes U+FFFD). */
+    text(self) -> string = from_bytes(c.blob_rawcontent(self.raw), self.len())
+
+    /** The content as it is stored, **borrowed from libgit2**, beside the blob that owns it.
+     *
+     * The slice points into the blob's own buffer, so it is valid exactly while the blob is — and a
+     * slice cannot yet keep a C owner alive by itself, so the two are handed back together and the
+     * slice must not be kept past the `Content` it came in. Copy it (`content.bytes.copy()`, or
+     * [text]) to keep the bytes.
+     */
+    content(&self) -> Content = Content(self, c.blob_rawcontent(self.raw)[0..<self.len()])
+end Blob
+
+impl GitObject for Blob
+    object_ptr(self) -> *c.Object = ptr_cast(self.raw)
+
+impl Drop for Blob
+    drop(self) = c.blob_free(self.raw)
+
+/** A blob's bytes, borrowed, beside the blob that keeps them alive. */
+struct Content
+    blob: &Blob
+    bytes: []u8
+
+/** An annotated tag. A lightweight tag is only a reference and has no object. */
+struct Tag
+    private[libgit2] raw: *c.Tag
+    private[libgit2] repo: &Repository
+
+    name(self) -> string = text(c.tag_name(self.raw))
+
+    /** The message, or `""` for a tag made without one. */
+    message(self) -> string = text(c.tag_message(self.raw))
+
+    /** The id of the object tagged. */
+    target_id(self) -> Oid = oid_at(c.tag_target_id(self.raw))
+
+    /** Who tagged it, where the tag says. */
+    tagger(self) -> Option[Signature]
+        val p = c.tag_tagger(self.raw)
+
+        if p == null then None else Some(signature_of(p))
+end Tag
+
+impl GitObject for Tag
+    object_ptr(self) -> *c.Object = ptr_cast(self.raw)
+
+impl Drop for Tag
+    drop(self) = c.tag_free(self.raw)
+
+/** A tree being built in memory, entry by entry, then written to the object database. */
+struct TreeBuilder
+    private[libgit2] raw: *c.TreeBuilder
+    private[libgit2] repo: &Repository
+
+    /** Add `name`, or replace it. */
+    insert(self, name: string, id: Oid, mode: Mode = File) -> Result[unit, Error]
+        var raw = id.raw
+
+        check(c.treebuilder_insert(null, self.raw, cstring(name).ptr, &raw, mode_code(mode)))
+
+    remove(self, name: string) -> Result[unit, Error] =
+        check(c.treebuilder_remove(self.raw, cstring(name).ptr))
+
+    len(self) -> usize = c.treebuilder_entrycount(self.raw)
+
+    /** Write the tree and answer its id. */
+    write(self) -> Result[Oid, Error]
+        var out = c.Oid([0; 20])
+
+        check(c.treebuilder_write(&out, self.raw))?
+        Ok(Oid(out))
+end TreeBuilder
+
+impl Drop for TreeBuilder
+    drop(self) = c.treebuilder_free(self.raw)
+
+// ## The repository's side: lookups and writes, reached through `Repository`'s methods
+
+private[libgit2] lookup_object(repo: &Repository, id: Oid, kind: Kind) -> Result[&Object, Error]
+    var out: *c.Object = null
+    var raw = id.raw
+
+    check(c.object_lookup(&out, repo.raw, &raw, kind_code(kind)))?
+    Ok(Object(out, repo))
+
+private[libgit2] lookup_commit(repo: &Repository, id: Oid) -> Result[&Commit, Error]
+    var out: *c.Commit = null
+    var raw = id.raw
+
+    check(c.commit_lookup(&out, repo.raw, &raw))?
+    Ok(Commit(out, repo))
+
+private[libgit2] lookup_tree(repo: &Repository, id: Oid) -> Result[&Tree, Error]
+    var out: *c.Tree = null
+    var raw = id.raw
+
+    check(c.tree_lookup(&out, repo.raw, &raw))?
+    Ok(Tree(out, repo))
+
+private[libgit2] lookup_blob(repo: &Repository, id: Oid) -> Result[&Blob, Error]
+    var out: *c.Blob = null
+    var raw = id.raw
+
+    check(c.blob_lookup(&out, repo.raw, &raw))?
+    Ok(Blob(out, repo))
+
+private[libgit2] lookup_tag(repo: &Repository, id: Oid) -> Result[&Tag, Error]
+    var out: *c.Tag = null
+    var raw = id.raw
+
+    check(c.tag_lookup(&out, repo.raw, &raw))?
+    Ok(Tag(out, repo))
+
+private[libgit2] revparse(repo: &Repository, spec: string) -> Result[&Object, Error]
+    var out: *c.Object = null
+
+    check(c.revparse_single(&out, repo.raw, cstring(spec).ptr))?
+    Ok(Object(out, repo))
+
+private[libgit2] write_blob(repo: &Repository, data: []const u8) -> Result[Oid, Error]
+    var out = c.Oid([0; 20])
+    val p: *u8 = if data.len == 0 then null else ptr_cast(&data[0])
+
+    check(c.blob_create_from_buffer(&out, repo.raw, p, data.len))?
+    Ok(Oid(out))
+
+private[libgit2] tree_builder(repo: &Repository, base: Option[&Tree]) -> Result[&TreeBuilder, Error]
+    var out: *c.TreeBuilder = null
+    val source: *c.Tree = base match
+        Some(t) -> t.raw
+        None -> null
+
+    check(c.treebuilder_new(&out, repo.raw, source))?
+    Ok(TreeBuilder(out, repo))
+
+private[libgit2] create_commit(repo: &Repository, update_ref: Option[string], author: Signature,
+                               committer: Signature, message: string, tree: &Tree,
+                               parents: []const &Commit) -> Result[Oid, Error]
+    val a = raw_signature(author)?
+    val m = raw_signature(committer)?
+    val ptrs: Buf[*c.Commit] = buf()
+
+    for p in parents do ptrs.push(p.raw)
+
+    val name = cstring(update_ref.unwrap_or(""))
+    var out = c.Oid([0; 20])
+    val view = ptrs.view()
+    val parent_array: **c.Commit = if view.len == 0 then null else &view[0]
+
+    check(c.commit_create(&out, repo.raw, if update_ref.is_some() then name.ptr else null, a.raw,
+                          m.raw, null, cstring(message).ptr, tree.raw, ptrs.len(), parent_array))?
+    Ok(Oid(out))
+end create_commit

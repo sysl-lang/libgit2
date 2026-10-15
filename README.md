@@ -6,6 +6,8 @@ branches and tags, checkout, history walks, diffs with patch text, status, blame
 stash, and credentials. Callbacks for checkout progress, fetch progress, diff walks, status walks,
 tag and stash walks, and credentials are ordinary sysl closures.
 
+*An independent sysl package for libgit2. It is not affiliated with or endorsed by libgit2's authors or trademark holders.*
+
 ```hocon
 dependencies {
   libgit2 { git = "github.com/sysl-lang/libgit2", version = "0.1.0" }
